@@ -419,7 +419,7 @@ app.get("/debug-enrich", async (req, res) => {
   }
 });
 
-// === Prueba si tu cuenta tiene acceso a web search ===
+// === Prueba si tu cuenta tiene acceso a web search (sin forzar formato) ===
 app.get("/try-web", async (req, res) => {
   try {
     const query = req.query.q || "Cagliari vs Sassuolo horario";
@@ -433,8 +433,7 @@ app.get("/try-web", async (req, res) => {
         model: "gpt-4o",
         input: query,
         tools: [{ type: "web_search" }],
-        tool_choice: "auto",
-        text: { format: "json" } // 👈 nuevo formato correcto
+        tool_choice: "auto"
       })
     });
     const json = await r.json();
