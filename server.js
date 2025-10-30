@@ -8,16 +8,13 @@ import { createClient } from "@supabase/supabase-js";
 
 // ===== Config =====
 const app = express();
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);                  // Postman / curl
-    if (/\.lovable\.app$/.test(new URL(origin).host)) return cb(null, true);
-    if (/localhost:\d+$/.test(new URL(origin).host + ":" + (new URL(origin).port || ""))) return cb(null, true);
-    return cb(null, true); // Si quieres cerrar, cambia a lista blanca estricta.
-  },
-  credentials: false
-}));
-app.use(express.json({ limit: "12mb" }));
+
+// 🔓 CORS temporalmente abierto (para descartar bloqueos)
+app.use(cors());                // permite cualquier origen
+app.options("*", cors());       // responde a preflights OPTIONS
+
+// 👇 si quieres mantener límite alto de payload (imágenes en JSON)
+app.use(express.json({ limit: "25mb" }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(
