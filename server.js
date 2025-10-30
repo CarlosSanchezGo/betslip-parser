@@ -68,23 +68,27 @@ async function enrichViaOpenAI(partido) {
     const resp = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content:
-`Eres un experto en deporte actual (2025). Dado un partido (p. ej., "J. Sinner vs F. Cerúndolo"),
-identifica:
-- torneo/competición,
-- fecha y hora exactas (si existen) en ISO UTC.
-Responde SOLO con JSON:
-{ "tournament": "...", "startIso": "...", "confidence": 0..1 }
-Si no estás seguro, devuelve startIso null y baja confidence.`
-        },
-        {
-          role: "user",
-          content: `Partido: ${partido}. Dame torneo y hora exacta. Si ya se jugó, usa la fecha del partido.`
-        }
-      ]
+    messages: [
+  {
+    role: "system",
+    content: `Eres un asistente experto en deporte actual (fecha actual: ${new Date().toISOString().slice(0, 10)}).
+Tu tarea es identificar, para un partido dado (p. ej., "J. Sinner vs F. Cerúndolo"), el torneo y la hora exacta en que se juega.
+IMPORTANTE:
+- Prioriza partidos que ocurren HOY, MAÑANA o en los PRÓXIMOS DÍAS (no pasados).
+- Si el partido no está programado próximamente, indica "null" en startIso.
+- Devuelve SOLO JSON válido con las claves:
+{
+  "tournament": "nombre del torneo o liga",
+  "startIso": "fecha y hora ISO UTC si se conoce o null",
+  "confidence": número entre 0 y 1
+}`
+  },
+  {
+    role: "user",
+    content: `Partido: ${partido}.
+Busca en la actualidad si está programado para hoy o los próximos días. Si ya ocurrió, devuelve startIso=null.`
+  }
+]  
     });
     const text = resp.choices?.[0]?.message?.content || "{}";
     let json = null;
