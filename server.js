@@ -339,43 +339,46 @@ app.post("/parse-rows", async (req, res) => {
     const parsed = await upstream.json();
 
     // Enriquecer + limpiar y construir filas para la tabla
-    const rows = [];
-    for (const sel of (parsed.selections || [])) {
-      let fechaISO = sel.fecha_hora_iso || null;
-      if (!fechaISO && sel.fecha_hora_texto) {
-        const iso = resolveRelativeDate(sel.fecha_hora_texto);
-        if (iso) fechaISO = iso;
-      }
+    // ... tras obtener `parsed` y (opcionalmente) cargar desde DB ...
 
-      try {
-        const found = await enrichGenericSelection({ partido: sel.partido });
-        if (found) {
-          if (!fechaISO && found.startIso) fechaISO = found.startIso;
-          if (!sel.torneo && found.tournament) sel.torneo = found.tournament;
-        }
-      } catch { /* ignore */ }
+const rows = [];
+for (const sel of (parsed.selections || [])) {
+  // lee última versión desde DB si la has implementado (dbById). Si no, usa sel:
+  // const db = sel.selection_id ? dbById[sel.selection_id] : null;
 
-      const casa = cleanBookmaker(sel.casa_apuestas || parsed.bookmaker, tipster_id);
+  // si no usas dbById, comenta las dos líneas siguientes:
+  const db = null; // o tu lookup real
+  let fechaISO   = db?.start_time_utc ?? sel.fecha_hora_iso ?? null;
+  const fechaTxt = db?.start_time_text ?? sel.fecha_hora_texto ?? "";
 
-      rows.push({
-        // 👇 Campos visibles de la tabla
-        "Partido": sel.partido,
-        "Torneo": sel.torneo || "",
-        "Fecha y hora": fechaISO
-          ? new Date(fechaISO).toLocaleString("es-ES", { dateStyle: "medium", timeStyle: "short" })
-          : (sel.fecha_hora_texto || ""),
-        "Mercado": sel.mercado,
-        "Apuesta": sel.apuesta,
-        "Cuota": sel.cuota,
-        "Casa de apuestas": casa || "",
-        // 👇 Metadatos ocultos para editar desde frontend
-        _betslip_id: parsed.betslip_id,
-        _selection_id: sel.selection_id || null,
-        _fecha_hora_iso: fechaISO || null
-      });
-    }
+  // fallback: si no hay ISO y hay texto relativo, intenta resolverlo a ISO
+  if (!fechaISO && fechaTxt) {
+    const iso = resolveRelativeDate(fechaTxt);
+    if (iso) fechaISO = iso;
+  }
 
-    return res.status(200).json(rows); // ARRAY puro para Lovable
+  rows.push({
+    "Partido": db?.match ?? sel.partido,
+    "Torneo": db?.tournament ?? sel.torneo ?? "",
+    // 👇 visible con fallback a texto
+    "Fecha y hora": fechaISO
+      ? new Date(fechaISO).toLocaleString("es-ES", { dateStyle: "medium", timeStyle: "short" })
+      : (fechaTxt || "(pendiente)"),
+    "Mercado": db?.market ?? sel.mercado,
+    "Apuesta": db?.pick ?? sel.apuesta,
+    "Cuota": db?.odds ?? sel.cuota,
+    "Casa de apuestas": (db?.bookmaker ?? sel.casa_apuestas ?? parsed.bookmaker) ? "" : "",
+
+    // metadatos ocultos
+    _betslip_id: parsed.betslip_id,
+    _selection_id: sel.selection_id || null,
+    _fecha_hora_iso: fechaISO || null,
+    _fecha_hora_texto: fechaTxt || ""   // 👈 nuevo: llevamos también el texto
+  });
+}
+
+return res.status(200).json(rows);
+      
   } catch (e) {
     return res.status(500).json({ error: e.message || String(e) });
   }
