@@ -180,6 +180,51 @@ Reglas:
   }
 });
 
+// ✅ NUEVO endpoint: devuelve DIRECTAMENTE un array de filas para la tabla
+app.post("/parse-rows", async (req, res) => {
+  try {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    const { image_url, tipster_id } = req.body || {};
+    if (!image_url || !tipster_id) {
+      return res.status(400).json({ error: "missing fields: image_url, tipster_id" });
+    }
+
+    // Llama internamente a tu lógica existente de /parse
+    const upstream = await fetch(`${req.protocol}://${req.get("host")}/parse`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image_url, tipster_id })
+    });
+
+    // Si /parse falló, propaga el error
+    if (!upstream.ok) {
+      const txt = await upstream.text();
+      return res.status(502).json({ error: "upstream /parse error", detail: txt });
+    }
+
+    const parsed = await upstream.json();
+
+    // Transforma el objeto en un ARRAY de filas para la tabla de Lovable
+    const rows = (parsed.selections || []).map((sel) => ({
+      "Partido": sel.partido,
+      "Torneo": sel.torneo || "",
+      "Fecha y hora": sel.fecha_hora_iso
+        ? new Date(sel.fecha_hora_iso).toLocaleString("es-ES", { dateStyle: "medium", timeStyle: "short" })
+        : (sel.fecha_hora_texto || ""),
+      "Mercado": sel.mercado,
+      "Apuesta": sel.apuesta,
+      "Cuota": sel.cuota,
+      "Casa de apuestas": sel.casa_apuestas || parsed.bookmaker || ""
+    }));
+
+    return res.status(200).json(rows); // 👈 array puro
+  } catch (e) {
+    return res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
 app.get("/health", (_req, res) => res.send("ok"));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server on " + PORT));
