@@ -77,19 +77,43 @@ const ENRICH_DEBUG = process.env.ENRICH_DEBUG === "true";
 const logD = (...args) => ENRICH_DEBUG && console.log("[ENRICH]", ...args);
 
 // ===== Timeout fetch =====
-async function fetchJsonWithTimeout(url, ms = 5000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const r = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "es-ES,es;q=0.9" },
-      signal: ctrl.signal
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return await r.json();
-  } finally {
-    clearTimeout(t);
+async function fetchJsonSmart(url, { timeoutMs = 6000, ua = "Mozilla/5.0", lang = "es-ES,es;q=0.9" } = {}) {
+  const direct = await (async () => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const r = await fetch(url, {
+        headers: { "User-Agent": ua, "Accept-Language": lang },
+        signal: ctrl.signal
+      });
+      return r;
+    } finally {
+      clearTimeout(t);
+    }
+  })();
+
+  // Si va bien directo, devuélvelo
+  if (direct.ok) return direct.json();
+
+  // Si nos bloquearon y tenemos ZenRows, reintenta vía proxy
+  if ((direct.status === 403 || direct.status === 429) && process.env.ZENROWS_API_KEY) {
+    const proxyUrl = `https://api.zenrows.com/v1/?url=${encodeURIComponent(url)}&js_render=false&premium_proxy=true&apikey=${process.env.ZENROWS_API_KEY}`;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs + 4000);
+    try {
+      const r = await fetch(proxyUrl, {
+        headers: { "User-Agent": ua, "Accept-Language": lang },
+        signal: ctrl.signal
+      });
+      if (!r.ok) throw new Error(`Proxy HTTP ${r.status}`);
+      return await r.json();
+    } finally {
+      clearTimeout(t);
+    }
   }
+
+  // Si no hay proxy o falló también, lanza error con el status original
+  throw new Error(`HTTP ${direct.status}`);
 }
 
 // ===== Normalización de nombres para mejorar “matches” =====
@@ -169,67 +193,54 @@ async function enrichGenericSelection(selection) {
   const raw = selection.partido || "";
   if (!raw) return null;
 
-  // 1) Separa los dos lados del partido por "vs"
+  // separa por "vs"
   const sides = raw.split(/vs/i).map(s => s.trim()).filter(Boolean);
-  if (sides.length < 2) {
-    logD("no 'vs' in match text", raw);
-    return null;
-  }
+  if (sides.length < 2) return null;
 
-  // 2) Normaliza y crea variantes (nombre sin iniciales + apellido)
+  // normalizadores
+  function normalizePlain(s) {
+    return (s || "")
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase().replace(/\./g, "").replace(/\s{2,}/g, " ").trim();
+  }
+  function strongTokens(s) {
+    const cleaned = s.replace(/\./g, "").replace(/\s{2,}/g, " ").trim();
+    return cleaned.split(/\s+/).filter(tok => tok.length > 1);
+  }
   function expandName(side) {
-    // Ej: "J. Sinner" -> ["J Sinner", "Sinner"]
     const plain = normalizePlain(side);
-    // tokens >= 2
     const tokens = plain.split(/\s+/).filter(Boolean);
-    const variants = new Set();
-
+    const set = new Set();
     if (tokens.length >= 2) {
-      // quita iniciales de 1 carácter
-      const noInitials = tokens.filter(t => t.length > 1).join(" ");
-      if (noInitials) variants.add(noInitials);
-      // añade sólo el último token (suele ser apellido)
-      variants.add(tokens[tokens.length - 1]);
+      set.add(tokens.filter(t => t.length > 1).join(" "));
+      set.add(tokens[tokens.length - 1]);
     } else {
-      variants.add(plain);
+      set.add(plain);
     }
-    return Array.from(variants);
+    return Array.from(set);
   }
-
-  // Corrige casos comunes de apellidos con/ sin tilde
   function addDiacriticAlternatives(v) {
     const out = new Set([v]);
     if (v.includes("cerundolo")) out.add(v.replace("cerundolo", "cerúndolo"));
-    if (v.includes("alcaraz")) out.add(v.replace("alcaraz", "álcaraz")); // por si acaso
-    // añade más reglas si lo necesitas
+    if (v.includes("alcaraz")) out.add(v.replace("alcaraz", "álcaraz"));
     return Array.from(out);
   }
 
   const leftVars  = expandName(sides[0]).flatMap(addDiacriticAlternatives);
   const rightVars = expandName(sides[1]).flatMap(addDiacriticAlternatives);
 
-  // 3) Primero intenta una búsqueda combinada (ambos apellidos)
+  // combinaciones "apellido apellido"
   const combinedQueries = [];
-  for (const a of leftVars) for (const b of rightVars) {
-    combinedQueries.push(`${a} ${b}`);
-  }
+  for (const a of leftVars) for (const b of rightVars) combinedQueries.push(`${a} ${b}`);
 
-  async function searchAll(q) {
-    const url = `${base}/search/all?q=${encodeURIComponent(q)}`;
-    return await fetchJsonWithTimeout(url, 6000);
-  }
-
-  // 4) Intenta encontrar IDs de jugadores de TENIS para cada lado
   async function topTennisCandidates(q) {
-    const res = await searchAll(q);
-    // Prioriza sección de tenis si existe
+    const res = await fetchJsonSmart(`${base}/search/all?q=${encodeURIComponent(q)}`);
     const tennis = res?.tennis;
     const fromTennis =
       (tennis?.players || []).map(p => ({ type: "player", id: p.id, name: p.name })).slice(0, 5);
-
     if (fromTennis.length) return fromTennis;
 
-    // Si no hay sección de tenis, abre a todo (por si el index cambia)
+    // fallback genérico si la sección de tenis no viene
     const generic = [];
     for (const section of Object.values(res || {})) {
       if (!section || typeof section !== "object") continue;
@@ -243,83 +254,74 @@ async function enrichGenericSelection(selection) {
     return generic.slice(0, 5);
   }
 
-  // 5) Dado un playerId, trae próximos eventos
-  async function nextEventsForPlayer(id) {
-    const url = `${base}/player/${id}/events/next/0`;
-    const data = await fetchJsonWithTimeout(url, 6000);
-    return Array.isArray(data?.events) ? data.events : [];
-  }
-
-  // === Estrategia A: búsqueda combinada y cruce de eventos ===
-  for (const combo of combinedQueries.slice(0, 6)) {
+  async function nextOrPrevEventsForPlayer(id) {
+    // next
     try {
-      const candLeft  = await topTennisCandidates(combo);
-      const candRight = candLeft; // con query combinada lo normal es que estén ambos
-      // Trae eventos de los primeros 3 jugadores detectados
-      const eventsById = {};
-      for (const c of candLeft.slice(0, 3)) {
-        const evs = await nextEventsForPlayer(c.id);
-        eventsById[c.id] = evs;
-      }
-      // Busca un evento donde aparezca *otra* variante del segundo lado
-      for (const evs of Object.values(eventsById)) {
-        for (const ev of evs) {
-          const home = normalizePlain(ev?.homeTeam?.name || "");
-          const away = normalizePlain(ev?.awayTeam?.name || "");
-          // ¿Contiene apellidos/variantes de ambos lados?
-          const hasLeft  = leftVars.some(v => home.includes(normalizePlain(v)) || away.includes(normalizePlain(v)));
-          const hasRight = rightVars.some(v => home.includes(normalizePlain(v)) || away.includes(normalizePlain(v)));
-          if (hasLeft && hasRight) {
-            const tournament = ev?.tournament?.name || ev?.season?.name || "";
-            const startIso   = ev?.startTimestamp ? new Date(ev.startTimestamp * 1000).toISOString() : null;
-            logD("A-match", combo, tournament, startIso);
-            return { tournament, startIso };
-          }
-        }
-      }
-    } catch (e) {
-      logD("A-fail", combo, String(e));
-    }
+      const d = await fetchJsonSmart(`${base}/player/${id}/events/next/0`);
+      if (Array.isArray(d?.events) && d.events.length) return d.events;
+    } catch {}
+    // previous
+    try {
+      const d = await fetchJsonSmart(`${base}/player/${id}/events/previous/0`);
+      if (Array.isArray(d?.events) && d.events.length) return d.events;
+    } catch {}
+    return [];
   }
 
-  // === Estrategia B: buscar cada lado por separado y cruzar agendas ===
-  async function firstCandidatesOrNull(vars) {
-    for (const v of vars) {
-      try {
-        const list = await topTennisCandidates(v);
-        if (list.length) return list.slice(0, 3);
-      } catch (e) {
-        logD("B-search-fail", v, String(e));
-      }
-    }
-    return null;
-  }
-
-  const leftCands  = await firstCandidatesOrNull(leftVars);
-  const rightCands = await firstCandidatesOrNull(rightVars);
-
-  if (!leftCands || !rightCands) {
-    logD("B-no-cands", { leftVars, rightVars });
-    return null;
-  }
-
-  // Trae eventos próximos de ambos lados y busca intersección (mismo eventId o vs por nombres)
-  const leftEventsPromises  = leftCands.map(c => nextEventsForPlayer(c.id));
-  const rightEventsPromises = rightCands.map(c => nextEventsForPlayer(c.id));
-  const leftEventsLists  = await Promise.allSettled(leftEventsPromises);
-  const rightEventsLists = await Promise.allSettled(rightEventsPromises);
-
-  const leftEvents  = leftEventsLists.flatMap(p => p.status === "fulfilled" ? (p.value || []) : []);
-  const rightEvents = rightEventsLists.flatMap(p => p.status === "fulfilled" ? (p.value || []) : []);
-
-  // Índice rápido por normalización de "home vs away"
   function sig(ev) {
     const h = normalizePlain(ev?.homeTeam?.name || "");
     const a = normalizePlain(ev?.awayTeam?.name || "");
     return h < a ? `${h} vs ${a}` : `${a} vs ${h}`;
   }
-  const rightIndex = new Map(rightEvents.map(ev => [sig(ev), ev]));
 
+  // === Estrategia A: query combinada y emparejar ===
+  for (const combo of combinedQueries.slice(0, 6)) {
+    try {
+      const cands = await topTennisCandidates(combo);
+      const eventsById = {};
+      await Promise.all(
+        cands.slice(0, 3).map(async c => {
+          eventsById[c.id] = await nextOrPrevEventsForPlayer(c.id);
+        })
+      );
+      // ¿hay evento que contenga apellidos de ambos lados?
+      for (const evs of Object.values(eventsById)) {
+        for (const ev of evs) {
+          const home = normalizePlain(ev?.homeTeam?.name || "");
+          const away = normalizePlain(ev?.awayTeam?.name || "");
+          const hasLeft  = leftVars.some(v => home.includes(normalizePlain(v)) || away.includes(normalizePlain(v)));
+          const hasRight = rightVars.some(v => home.includes(normalizePlain(v)) || away.includes(normalizePlain(v)));
+          if (hasLeft && hasRight) {
+            const tournament = ev?.tournament?.name || ev?.season?.name || "";
+            const startIso   = ev?.startTimestamp ? new Date(ev.startTimestamp * 1000).toISOString() : null;
+            return { tournament, startIso };
+          }
+        }
+      }
+    } catch { /* sigue */ }
+  }
+
+  // === Estrategia B: buscar cada lado por separado y cruzar agendas ===
+  async function firstCands(vars) {
+    for (const v of vars) {
+      try {
+        const list = await topTennisCandidates(v);
+        if (list.length) return list.slice(0, 3);
+      } catch {}
+    }
+    return null;
+  }
+
+  const leftCands  = await firstCands(leftVars);
+  const rightCands = await firstCands(rightVars);
+  if (!leftCands || !rightCands) return null;
+
+  const leftEvents  = (await Promise.allSettled(leftCands.map(c => nextOrPrevEventsForPlayer(c.id))))
+    .flatMap(p => p.status === "fulfilled" ? (p.value || []) : []);
+  const rightEvents = (await Promise.allSettled(rightCands.map(c => nextOrPrevEventsForPlayer(c.id))))
+    .flatMap(p => p.status === "fulfilled" ? (p.value || []) : []);
+
+  const rightIndex = new Map(rightEvents.map(ev => [sig(ev), ev]));
   for (const ev of leftEvents) {
     const key = sig(ev);
     if (rightIndex.has(key)) {
@@ -327,12 +329,10 @@ async function enrichGenericSelection(selection) {
       const startUnix = ev.startTimestamp || twin.startTimestamp;
       const tournament = ev?.tournament?.name || twin?.tournament?.name || ev?.season?.name || twin?.season?.name || "";
       const startIso = startUnix ? new Date(startUnix * 1000).toISOString() : null;
-      logD("B-match", { key, tournament, startIso });
       return { tournament, startIso };
     }
   }
 
-  logD("no match", { leftVars, rightVars });
   return null;
 }
 
