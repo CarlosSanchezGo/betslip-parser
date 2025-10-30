@@ -64,47 +64,46 @@ function cleanBookmaker(name, tipsterId) {
 
 async function enrichViaOpenAI(partido) {
   if (!partido) return null;
+
   try {
-    const resp = await openai.chat.completions.create({
+    const today = new Date().toISOString().slice(0, 10);
+    const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.2,
-    messages: [
-  {
-    role: "system",
-    content: `Eres un asistente experto en deporte actual (fecha actual: ${new Date().toISOString().slice(0, 10)}).
-Tu tarea es identificar, para un partido dado (p. ej., "J. Sinner vs F. Cerúndolo"), el torneo y la hora exacta en que se juega.
-IMPORTANTE:
-- Prioriza partidos que ocurren HOY, MAÑANA o en los PRÓXIMOS DÍAS (no pasados).
-- Si el partido no está programado próximamente, indica "null" en startIso.
-- Devuelve SOLO JSON válido con las claves:
-{
-  "tournament": "nombre del torneo o liga",
-  "startIso": "fecha y hora ISO UTC si se conoce o null",
-  "confidence": número entre 0 y 1
-}`
-  },
-  {
-    role: "user",
-    content: `Partido: ${partido}.
-Busca en la actualidad si está programado para hoy o los próximos días. Si ya ocurrió, devuelve startIso=null.`
-  }
-]  
+      messages: [
+        {
+          role: "system",
+          content: `Eres un experto en deporte profesional (fecha actual: ${today}).
+Tu tarea es identificar el torneo y la hora (ISO UTC) de un partido dado.
+PRIORIDAD:
+- Da prioridad a partidos que se juegan hoy, mañana o los próximos días.
+- Si ya ocurrió, devuelve startIso=null.
+Responde SOLO con JSON válido:
+{ "tournament": "...", "startIso": "...", "confidence": número entre 0 y 1 }`
+        },
+        {
+          role: "user",
+          content: `Partido: ${partido}.
+Busca si está programado para hoy, mañana o próximamente.
+Si no hay partidos cercanos, devuelve startIso=null y confidence baja.`
+        }
+      ]
     });
-    const text = resp.choices?.[0]?.message?.content || "{}";
+
+    const text = completion.choices?.[0]?.message?.content || "{}";
     let json = null;
     try {
       json = JSON.parse(text);
     } catch {
-      // Intenta limpiar ruido
-      const start = text.indexOf("{");
-      const end = text.lastIndexOf("}");
-      if (start >= 0 && end > start) json = JSON.parse(text.slice(start, end+1));
+      const s = text.indexOf("{");
+      const e = text.lastIndexOf("}");
+      if (s >= 0 && e > s) json = JSON.parse(text.slice(s, e + 1));
     }
-    if (json && json.tournament) return json;
+    return json || null;
   } catch (e) {
     console.error("[OpenAI enrich error]", e.message);
+    return null;
   }
-  return null;
 }
 
 async function parseImageWithOpenAI(image_url) {
