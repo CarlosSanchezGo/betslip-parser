@@ -1,21 +1,19 @@
 // server.js
-// Backend: parsea betslips desde imagen, enriquece torneo/hora (hoy→+3 días) con OpenAI y persiste en Supabase.
+// Backend: parsea tickets, enriquece torneo/hora (HOY→+3 días) con OpenAI y persiste en Supabase.
 
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 
-// ====== App & CORS ======
+// ===== App & CORS =====
 const app = express();
-
-// CORS abierto para pruebas; ciérralo a tu dominio de Lovable cuando quieras
+// CORS abierto (para pruebas). Luego puedes cerrarlo a tu dominio de Lovable.
 app.use(cors());
 app.options("*", cors());
-
 app.use(express.json({ limit: "25mb" }));
 
-// ====== SDKs ======
+// ===== SDKs =====
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 if (!process.env.SUPABASE_URL) throw new Error("SUPABASE_URL is required");
 if (!process.env.SUPABASE_KEY && !process.env.SUPABASE_SERVICE_ROLE) {
@@ -26,32 +24,27 @@ const supabase = createClient(
   process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE
 );
 
-const TZ = process.env.BASE_TZ || "Europe/Madrid";
-
-// ====== Helpers ======
+// ===== Helpers =====
 function toISOFromES(text) {
-  // Convierte "30/10/2025 19:00" o "30-10-2025 19:00" a ISO UTC simple
+  // "30/10/2025 19:00" o "30-10-2025 19:00" -> ISO UTC
   if (!text) return null;
   const m = text.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\s+(\d{1,2}):(\d{2})/);
   if (!m) return null;
-  const [ , d, M, y, h, min ] = m.map(Number);
-  // Interpretamos como hora local *aproximada* y devolvemos ISO UTC
+  const [, d, M, y, h, min] = m.map(Number);
   const local = new Date(y, M - 1, d, h, min, 0, 0);
   return new Date(local.getTime() - local.getTimezoneOffset() * 60000).toISOString();
 }
 
 function resolveRelativeDate(text) {
-  // "Hoy 19:00" / "Mañana 06:30"
+  // "Hoy 19:00" / "Mañana 06:30" -> ISO UTC aproximado
   if (!text) return null;
   const lower = text.toLowerCase();
   const hm = text.match(/(\d{1,2}):(\d{2})/);
   if (!hm) return null;
-  const [ , h, m ] = hm.map(Number);
+  const [, h, m] = hm.map(Number);
   const now = new Date();
   let local = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0);
-  if (/mañana/.test(lower)) {
-    local = new Date(local.getTime() + 24 * 60 * 60 * 1000);
-  }
+  if (/mañana/.test(lower)) local = new Date(local.getTime() + 24 * 60 * 60 * 1000);
   return new Date(local.getTime() - local.getTimezoneOffset() * 60000).toISOString();
 }
 
@@ -76,67 +69,92 @@ function safeParseJson(text) {
   }
 }
 
-// ====== OpenAI: enriquecimiento (hoy → +3 días) con precisión de torneo ======
+// Heurística simple para detectar deporte
+function detectSport(partido) {
+  const p = (partido || "").toLowerCase();
+  const hasInitials = /\b[A-Z]\.\s?[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]/.test(partido); // "J. Sinner"
+  const hasAmpPair = /\/|&/.test(partido); // dobles
+  const looksTennis = hasInitials || hasAmpPair || /\bset|games?\b/i.test(partido);
+  const looksSoccer = /\bfc\b|\breal\b|\batl[eé]tico\b|united|city|cf\b|inter|madrid|barcelona|arsenal|juventus/i.test(p);
+  const looksBasket = /\blakers|warriors|celtics|bucks|euroliga|euroleague|nba/i.test(p);
+
+  if (looksTennis && !looksSoccer && !looksBasket) return "tennis";
+  if (looksSoccer && !looksBasket) return "soccer";
+  if (looksBasket) return "basketball";
+  return "unknown";
+}
+
+// ===== OpenAI: enriquecimiento robusto (HOY→+3 días, JSON forzado, reintentos) =====
 async function enrichViaOpenAI(partido) {
   if (!partido) return null;
 
   const todayISO = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-  try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.1,
-      messages: [
-        {
-          role: "system",
-          content:
-`Eres un asistente experto en deporte actual (fecha actual: ${todayISO}).
-Objetivo: Para un partido dado, responde SOLO si existe un encuentro programado para HOY, MAÑANA o como máximo en los PRÓXIMOS 3 DÍAS.
+  const sport = detectSport(partido);
+
+  async function oneTry(alt = 0) {
+    const sys = `
+Eres un asistente experto en deporte actual (fecha actual: ${todayISO}).
+Objetivo: Para el partido dado, responde SOLO si existe un encuentro programado para HOY, MAÑANA o como máximo en los PRÓXIMOS 3 DÍAS.
 Exige precisión:
 - "tournament": nombre OFICIAL y específico (ej.: "Swiss Indoors Basel (ATP 500)"; nunca "ATP Tour" genérico).
+- "tournamentTz": zona horaria IANA del torneo (ej.: "Europe/Zurich", "Europe/Madrid", "America/New_York").
 - "startLocal": fecha y hora LOCAL del torneo (ej.: "2025-10-30 19:00"), 24h sin zona.
-- "tournamentTz": zona horaria IANA del torneo (ej.: "Europe/Zurich").
 - "startIso": la misma hora convertida a UTC en ISO (ej.: "2025-10-30T18:00:00Z").
 - "confidence": 0..1.
-
 Si NO hay partido en la ventana (hoy → +3 días), devuelve:
-{ "tournament": null, "startLocal": null, "tournamentTz": null, "startIso": null, "confidence": 0.1 }.
+{ "tournament": null, "tournamentTz": null, "startLocal": null, "startIso": null, "confidence": 0.1 }.
+NO inventes. Si dudas del torneo o la hora exacta, devuelve startIso=null. Devuelve SOLO JSON válido.`.trim();
 
-NO inventes. Si dudas del torneo o la hora exacta, devuelve startIso=null. Devuelve SOLO JSON válido.`
-        },
-        {
-          role: "user",
-          content:
-`Partido: ${partido}.
-Dime el torneo exacto y la hora si el encuentro es HOY, MAÑANA o como mucho los próximos 3 días.
-Si el último partido conocido fue en otra fecha pasada o lejana, NO lo des: devuelve startIso=null.`
-        }
+    const user = `Partido: ${partido}.
+Deporte estimado: ${sport}.
+${alt === 0
+  ? `Busca si está programado para HOY, MAÑANA o los PRÓXIMOS 3 DÍAS. Evita partidos pasados (p. ej., Miami en marzo).`
+  : `Confirma SOLO partidos HOY/MAÑANA/+3 días. Si hay ambigüedad, devuelve startIso=null. Da el torneo OFICIAL (no "ATP Tour").`
+}`;
+
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o",
+      temperature: 0.0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: user }
       ]
     });
 
-    const text = completion.choices?.[0]?.message?.content || "{}";
-    const json = safeParseJson(text) || {};
-    // Post-validación: ventana temporal
-    if (json?.startIso) {
-      const now = Date.now();
-      const t = Date.parse(json.startIso);
-      const max = now + 3 * 24 * 60 * 60 * 1000; // +3 días
-      if (isNaN(t) || t < now - 10 * 60 * 1000 || t > max) { // tolerancia -10 min
-        json.startIso = null;
-      }
-    }
-    // Torneo específico (no genérico)
-    if (json?.tournament && /atp tour|wta tour|league|liga|tournament/i.test(json.tournament) &&
-        !/\b(ATP|WTA|ITF|Challenger|Grand Slam|Masters|1000|500|250|Copa|Swiss Indoors|Basel|Madrid|Roma|Paris|Acapulco|Miami|Shanghai|Doha|Dubai|Barcelona|Monte-Carlo)\b/i.test(json.tournament)) {
-      json.tournament = null;
-    }
-    return json || null;
-  } catch (e) {
-    console.error("[OpenAI enrich error]", e.message);
-    return null;
+    return resp.choices?.[0]?.message?.content || "{}";
   }
+
+  let raw = await oneTry(0);
+  let json = safeParseJson(raw) || {};
+
+  const now = Date.now();
+  const max = now + 3 * 24 * 60 * 60 * 1000; // +3 días
+  const invalidGenericTournament = (name) =>
+    !!(name && /atp tour|wta tour|tournament|league|liga/i.test(name) &&
+      !/\b(ATP|WTA|ITF|Challenger|Grand Slam|Masters|1000|500|250|Copa|Swiss Indoors|Basel|Madrid|Roma|Paris|Acapulco|Miami|Shanghai|Doha|Dubai|Barcelona|Monte-Carlo|Euroleague|LaLiga|Premier|Champions|Europa League)\b/i.test(name));
+
+  const fixJson = (j) => {
+    if (j?.startIso) {
+      const t = Date.parse(j.startIso);
+      if (isNaN(t) || t < now - 10 * 60 * 1000 || t > max) j.startIso = null; // tolerancia -10 min
+    }
+    if (invalidGenericTournament(j?.tournament)) j.tournament = null;
+    return j;
+  };
+
+  json = fixJson(json);
+
+  if (!json?.tournament || !json?.startIso) {
+    raw = await oneTry(1);
+    let json2 = safeParseJson(raw) || {};
+    json = fixJson(json2);
+  }
+
+  return json || null;
 }
 
-// ====== OpenAI: extracción desde imagen ======
+// ===== OpenAI: extracción desde imagen =====
 async function parseImageWithOpenAI(image_url) {
   const prompt =
 `Extrae las selecciones del ticket de apuesta en JSON.
@@ -171,10 +189,10 @@ Responde SOLO con JSON: { "bookmaker": "...", "selections": [ ... ] }`;
   return json;
 }
 
-// ====== Rutas ======
+// ===== Rutas =====
 app.get("/health", (_req, res) => res.type("text/plain").send("ok"));
 
-// Subida simulada (si usas Storage externo, puedes obviar esto)
+// (Mock) URL de subida si la necesitas
 app.post("/upload-url", async (req, res) => {
   const { filename } = req.body || {};
   if (!filename) return res.status(400).json({ error: "missing filename" });
@@ -218,7 +236,7 @@ app.post("/parse-rows", async (req, res) => {
       let fecha_hora_iso =
         toISOFromES(fecha_hora_texto) || resolveRelativeDate(fecha_hora_texto);
 
-      // Enriquecer (solo si falta torneo o falta ISO)
+      // Enriquecer (si falta torneo o ISO)
       if ((!torneo || !fecha_hora_iso) && partido) {
         const gpt = await enrichViaOpenAI(partido);
         if (gpt) {
@@ -249,6 +267,7 @@ app.post("/parse-rows", async (req, res) => {
         .single();
       if (selErr) throw new Error(`supabase(bet_selections.insert): ${selErr.message}`);
 
+      // Render local en el navegador del usuario
       const visibleFecha = selIns.start_time_utc
         ? new Date(selIns.start_time_utc).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
         : (selIns.start_time_text || "(pendiente)");
@@ -256,14 +275,14 @@ app.post("/parse-rows", async (req, res) => {
       rows.push({
         "Partido": selIns.match || "",
         "Torneo": selIns.tournament || "",
-        "Fecha y hora": visibleFecha, // El navegador lo pinta en la zona del usuario
+        "Fecha y hora": visibleFecha,          // local para el usuario
         "Mercado": selIns.market || "",
         "Apuesta": selIns.pick || "",
         "Cuota": selIns.odds,
         "Casa de apuestas": selIns.bookmaker || "",
         _betslip_id: betslip_id,
         _selection_id: selIns.id,
-        _fecha_hora_iso: selIns.start_time_utc,  // UTC para guardar/editar
+        _fecha_hora_iso: selIns.start_time_utc,     // UTC para persistir/editar
         _fecha_hora_texto: selIns.start_time_text || ""
       });
     }
@@ -317,7 +336,8 @@ app.post("/update-stake", async (req, res) => {
   try {
     const { betslip_id, stake, currency } = req.body || {};
     if (!betslip_id) return res.status(400).json({ error: "missing betslip_id" });
-  const value =
+
+    const value =
       stake === null || typeof stake === "undefined"
         ? null
         : (typeof stake === "number" ? stake : parseFloat(String(stake).replace(",", ".")));
@@ -340,7 +360,35 @@ app.post("/update-stake", async (req, res) => {
   }
 });
 
-// Debug: solo enriquecimiento con OpenAI (GET desde navegador)
+// Debug crudo (ver salida antes de filtros)
+app.get("/debug-enrich-raw", async (req, res) => {
+  try {
+    const partido = req.query.partido || "";
+    if (!partido) return res.status(400).json({ error: "missing partido" });
+    const todayISO = new Date().toISOString().slice(0, 10);
+    const sport = detectSport(partido);
+
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o",
+      temperature: 0.0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: `Eres un experto en deporte (${todayISO}). Da partido si es HOY/MAÑANA/+3 días; si no, startIso=null. JSON estricto.` },
+        { role: "user", content: `Partido: ${partido}. Deporte estimado: ${sport}.` }
+      ]
+    });
+
+    res.json({
+      ok: true,
+      partido,
+      raw: resp.choices?.[0]?.message?.content || ""
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Debug normal (con filtros aplicados)
 app.get("/debug-enrich", async (req, res) => {
   try {
     const partido = req.query.partido || "";
@@ -352,7 +400,8 @@ app.get("/debug-enrich", async (req, res) => {
   }
 });
 
-// ====== Start ======
+// ===== Start =====
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`✅ Server running on port ${port}`));
+
 
