@@ -419,6 +419,24 @@ app.get("/debug-enrich", async (req, res) => {
   }
 });
 
+// Endpoint temporal para probar si tu API tiene acceso a 'web search'
+app.get("/try-web", async (req, res) => {
+  try {
+    const query = req.query.q || "Cagliari vs Sassuolo horario";
+    const completion = await openai.responses.create({
+      model: "gpt-4o", // usa gpt-4o, es el único con browsing
+      input: query,
+      tools: [{ type: "web_search" }],
+      tool_choice: "auto",
+      response_format: { type: "json_object" }
+    });
+
+    res.json(completion.output || completion);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ===== Start =====
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`✅ Server running on port ${port}`));
