@@ -135,7 +135,7 @@ async function enrichViaWeb(partido, horaTexto = null) {
       input: userPrompt,
       tools: [{
         type: "web_search",
-        user_location: { country: "ES", timezone: "Europe/Madrid" },
+        user_location: { type: "approximate", country: "ES", timezone: "Europe/Madrid" },
         search_context_size: "medium"
       }],
       tool_choice: "auto",
