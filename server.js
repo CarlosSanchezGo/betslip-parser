@@ -192,15 +192,34 @@ Responde SOLO con JSON: { "bookmaker": "...", "selections": [ ... ] }`;
 // ===== Rutas =====
 app.get("/health", (_req, res) => res.type("text/plain").send("ok"));
 
-// (Mock) URL de subida si la necesitas
 app.post("/upload-url", async (req, res) => {
   const { filename } = req.body || {};
   if (!filename) return res.status(400).json({ error: "missing filename" });
-  return res.json({
-    uploadUrl: `https://files.example/${encodeURIComponent(filename)}`,
-    publicUrl: `https://files.example/${encodeURIComponent(filename)}`
-  });
+
+  try {
+    // nombre del bucket (puedes cambiarlo si quieres)
+    const bucket = process.env.SUPABASE_BUCKET || "uploads";
+
+    // genera una URL firmada para subir la imagen directamente desde Lovable
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .createSignedUploadUrl(filename);
+
+    if (error) throw error;
+
+    // URL pública (para que OpenAI o tu backend pueda leerla)
+    const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${bucket}/${encodeURIComponent(filename)}`;
+
+    res.json({
+      uploadUrl: data.signedUrl,
+      publicUrl
+    });
+  } catch (e) {
+    console.error("upload-url error:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
+
 
 // Procesa imagen, enriquece y guarda
 app.post("/parse-rows", async (req, res) => {
