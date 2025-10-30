@@ -61,6 +61,74 @@ function resolveRelativeDate(text, now = new Date()) {
   return iso;
 }
 
+// ===== Debug =====
+const ENRICH_DEBUG = process.env.ENRICH_DEBUG === "true";
+const logD = (...args) => ENRICH_DEBUG && console.log("[ENRICH]", ...args);
+
+// ===== Timeout fetch =====
+async function fetchJsonWithTimeout(url, ms = 5000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept-Language": "es-ES,es;q=0.9" },
+      signal: ctrl.signal
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// ===== Normalización de nombres para mejorar “matches” =====
+// Quita iniciales tipo "J." y retorna apellidos/nombres fuertes
+function strongTokens(s) {
+  if (!s) return [];
+  const cleaned = s
+    .replace(/\./g, "")        // “J. Sinner” -> “J Sinner”
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  // tokens sin iniciales sueltas
+  return cleaned
+    .split(/\s+/)
+    .filter(tok => tok.length > 1); // quita “J”
+}
+
+// De "J. Sinner vs F. Cerúndolo" -> ["Sinner","Cerúndolo"]
+function extractKeySurnames(matchText) {
+  const base = (matchText || "").replace(/[-–—]/g, " ");
+  // separamos por "vs", "/", ","
+  const parts = base.split(/vs|\/|,|\(|\)|\s{2,}/i)
+    .map(s => s.trim())
+    .filter(Boolean);
+  // para cada parte, coge el último token “fuerte” (suele ser apellido)
+  const keys = parts.map(p => {
+    const toks = strongTokens(p);
+    return toks.length ? toks[toks.length - 1] : p;
+  });
+  // dedup
+  return Array.from(new Set(keys)).slice(0, 4);
+}
+
+// Todas las variaciones posibles que vamos a probar en búsqueda
+function nameVariants(matchText) {
+  const baseNames = extractKeySurnames(matchText); // apellidos fuertes
+  const rawParts = (matchText || "")
+    .replace(/[-–—]/g, " ")
+    .split(/vs|\/|,|\(|\)|\s{2,}/i)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const initialsRemoved = Array.from(new Set(
+    rawParts.map(p => strongTokens(p).join(" "))
+  )).filter(Boolean);
+
+  // Mezcla ambas listas
+  const all = Array.from(new Set([...baseNames, ...initialsRemoved])).slice(0, 6);
+  return all;
+}
+
 // ============== ENRIQUECIMIENTO MULTI-DEPORTE (SofaScore) ==============
 const matchCache = new Map();
 const CACHE_MS = 5 * 60 * 1000;
@@ -86,66 +154,89 @@ async function fetchJson(url) {
  * Devuelve { tournament, startIso } o null.
  */
 async function enrichGenericSelection(selection) {
-  const names = parseNamesFromMatch(selection.partido);
-  if (!names.length) return null;
-
-  const cacheKey = `generic:${names.join("|")}`;
-  const cached = matchCache.get(cacheKey);
-  if (cached && Date.now() - cached.ts < CACHE_MS) return cached.data;
-
   const base = "https://api.sofascore.com/api/v1";
-  const candidates = [];
+  const variants = nameVariants(selection.partido);
+  if (!variants.length) return null;
 
-  // Busca con el primer nombre; si hay candidatos, seguimos con esos
-  for (const name of names) {
+  const cacheKey = `generic:${variants.join("|")}`;
+  const cached = matchCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < CACHE_MS) {
+    logD("cache hit", cacheKey, cached.data);
+    return cached.data;
+  }
+
+  logD("search variants", variants);
+
+  let candidates = [];
+  // 1) Buscar por varias variantes hasta encontrar candidatos
+  for (const name of variants) {
     try {
       const q = encodeURIComponent(name);
-      const search = await fetchJson(`${base}/search/all?q=${q}`);
-
+      const url = `${base}/search/all?q=${q}`;
+      const search = await fetchJsonWithTimeout(url, 6000);
+      // recolecta players & teams de todas las secciones
       for (const section of Object.values(search || {})) {
         if (!section || typeof section !== "object") continue;
         if (Array.isArray(section.players)) {
-          section.players.slice(0, 3).forEach(p => candidates.push({ type: "player", id: p.id }));
+          section.players.slice(0, 3).forEach(p => candidates.push({ type: "player", id: p.id, n: name }));
         }
         if (Array.isArray(section.teams)) {
-          section.teams.slice(0, 3).forEach(t => candidates.push({ type: "team", id: t.id }));
+          section.teams.slice(0, 3).forEach(t => candidates.push({ type: "team", id: t.id, n: name }));
         }
       }
-    } catch { /* ignore */ }
-    if (candidates.length) break;
+      if (candidates.length) {
+        logD("found candidates for", name, candidates.slice(0, 5));
+        break;
+      }
+    } catch (e) {
+      logD("search fail", name, String(e));
+    }
   }
 
-  for (const c of candidates.slice(0, 8)) {
+  // Si no hay candidatos aún, intento “todo a pelo” con la primera palabra
+  if (!candidates.length && variants[0]) {
+    logD("no candidates; giving up");
+    return null;
+  }
+
+  // 2) Probar próximos eventos de esos candidatos
+  for (const c of candidates.slice(0, 10)) {
     try {
       const url =
         c.type === "team"
           ? `${base}/team/${c.id}/events/next/0`
           : `${base}/player/${c.id}/events/next/0`;
-      const data = await fetchJson(url);
+      const data = await fetchJsonWithTimeout(url, 6000);
       const events = Array.isArray(data?.events) ? data.events : [];
       for (const ev of events) {
         const home = (ev?.homeTeam?.name || "").toLowerCase();
         const away = (ev?.awayTeam?.name || "").toLowerCase();
-        const hits = names.filter(n => {
-          const s = n.toLowerCase();
+        // cuenta cuántas variantes “casan” con home/away
+        const hits = variants.filter(v => {
+          const s = v.toLowerCase();
           return home.includes(s) || away.includes(s);
         }).length;
 
-        if (hits >= Math.min(2, names.length)) {
+        if (hits >= Math.min(2, variants.length)) {
           const tournament = ev?.tournament?.name || ev?.season?.name || "";
           const startIso = ev?.startTimestamp
             ? new Date(ev.startTimestamp * 1000).toISOString()
             : null;
           const result = { tournament, startIso };
           matchCache.set(cacheKey, { ts: Date.now(), data: result });
+          logD("match!", { variants, tournament, startIso, eventId: ev.id });
           return result;
         }
       }
-    } catch { /* ignore */ }
+    } catch (e) {
+      logD("events fail", c, String(e));
+    }
   }
 
+  logD("no match for", variants);
   return null;
 }
+
 
 // ============== VALIDACIÓN (Zod) ==============
 const SelectionSchema = z.object({
@@ -448,6 +539,18 @@ app.post("/update-stake", async (req, res) => {
 
     if (error) return res.status(500).json({ error: error.message });
     return res.json({ ok: true, betslip: data });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+// Debug: probar enriquecimiento desde navegador
+app.get("/debug-enrich", async (req, res) => {
+  try {
+    const partido = req.query.partido || "";
+    if (!partido) return res.status(400).json({ error: "missing partido" });
+    const found = await enrichGenericSelection({ partido });
+    return res.json({ ok: true, partido, found });
   } catch (e) {
     return res.status(500).json({ error: e.message || String(e) });
   }
