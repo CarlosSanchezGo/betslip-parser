@@ -1,10 +1,31 @@
 import express from "express";
+import cors from "cors";
 import fetch from "node-fetch";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 
 const app = express();
-app.use(express.json({ limit: "25mb" }));
+
+/** CORS: permite Lovable + localhost */
+const ALLOWED = [
+  /\.lovable\.app$/,          // cualquier subdominio de Lovable (prod)
+  /localhost:\d+$/,           // desarrollo local (3000, 5173, etc.)
+];
+
+app.use(cors({
+  origin: (origin, cb) => {
+    // permite peticiones sin origin (curl, Postman) y las que hagan match con ALLOWED
+    if (!origin) return cb(null, true);
+    if (ALLOWED.some(rx => rx.test(origin))) return cb(null, true);
+    return cb(new Error(`CORS: origin no permitido -> ${origin}`));
+  },
+  credentials: false,
+}));
+
+// Responder preflight de todo (por si el navegador hace OPTIONS)
+app.options("*", cors());
+
+app.use(express.json({ limit: "25mb" }));   // 👈 deja esto DESPUÉS de CORS
 
 // === CONFIG ===
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
