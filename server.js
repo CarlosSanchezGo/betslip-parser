@@ -1,20 +1,32 @@
 // server.js
-// Backend: parsea tickets, enriquece torneo/hora (HOY→+3 días) con OpenAI y persiste en Supabase.
+// API: sube imagen a Supabase, parsea betslip con OpenAI, enriquece torneo/hora con web_search y guarda en Supabase.
 
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 
-// ===== App & CORS =====
+// ===== App & middleware =====
 const app = express();
-// CORS abierto (para pruebas). Luego puedes cerrarlo a tu dominio de Lovable.
-app.use(cors());
-app.options("*", cors());
+
+// Log sencillo para depurar orígenes/rutas
+app.use((req, _res, next) => {
+  console.log("[REQ]", req.method, req.path, "Origin:", req.headers.origin || "-");
+  next();
+});
+
+app.use(cors({ origin: true }));  // abre mientras depuras; luego limita a [/\.lovable\.app$/, /localhost:\d+$/]
+app.options("*", cors({ origin: true }));
 app.use(express.json({ limit: "25mb" }));
 
+// ===== ENV / Flags =====
+const USE_WEB = (process.env.USE_WEB_ENRICH || "false").toLowerCase() === "true";
+const USE_OPENAI = (process.env.USE_OPENAI_ENRICH || "false").toLowerCase() === "true";
+
 // ===== SDKs =====
+if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required");
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 if (!process.env.SUPABASE_URL) throw new Error("SUPABASE_URL is required");
 if (!process.env.SUPABASE_KEY && !process.env.SUPABASE_SERVICE_ROLE) {
   throw new Error("SUPABASE_KEY or SUPABASE_SERVICE_ROLE is required");
@@ -26,7 +38,6 @@ const supabase = createClient(
 
 // ===== Helpers =====
 function toISOFromES(text) {
-  // "30/10/2025 19:00" o "30-10-2025 19:00" -> ISO UTC
   if (!text) return null;
   const m = text.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\s+(\d{1,2}):(\d{2})/);
   if (!m) return null;
@@ -36,7 +47,6 @@ function toISOFromES(text) {
 }
 
 function resolveRelativeDate(text) {
-  // "Hoy 19:00" / "Mañana 06:30" -> ISO UTC aproximado
   if (!text) return null;
   const lower = text.toLowerCase();
   const hm = text.match(/(\d{1,2}):(\d{2})/);
@@ -51,121 +61,177 @@ function resolveRelativeDate(text) {
 function cleanBookmaker(name, tipsterId) {
   if (!name) return null;
   const n = ("" + name).toLowerCase().trim();
-  if (tipsterId && n.includes(String(tipsterId).toLowerCase())) return null; // no confundir tipster con casa
+  if (tipsterId && n.includes(String(tipsterId).toLowerCase())) return null;
   if (n.includes("tipster")) return null;
   return name;
 }
 
 function safeParseJson(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    const s = text.indexOf("{");
-    const e = text.lastIndexOf("}");
-    if (s >= 0 && e > s) {
-      try { return JSON.parse(text.slice(s, e + 1)); } catch { return null; }
-    }
+  try { return JSON.parse(text); } catch {
+    const s = text.indexOf("{"); const e = text.lastIndexOf("}");
+    if (s >= 0 && e > s) { try { return JSON.parse(text.slice(s, e + 1)); } catch { return null; } }
     return null;
   }
 }
 
-// Heurística simple para detectar deporte
 function detectSport(partido) {
   const p = (partido || "").toLowerCase();
-  const hasInitials = /\b[A-Z]\.\s?[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]/.test(partido); // "J. Sinner"
-  const hasAmpPair = /\/|&/.test(partido); // dobles
-  const looksTennis = hasInitials || hasAmpPair || /\bset|games?\b/i.test(partido);
-  const looksSoccer = /\bfc\b|\breal\b|\batl[eé]tico\b|united|city|cf\b|inter|madrid|barcelona|arsenal|juventus/i.test(p);
-  const looksBasket = /\blakers|warriors|celtics|bucks|euroliga|euroleague|nba/i.test(p);
-
-  if (looksTennis && !looksSoccer && !looksBasket) return "tennis";
-  if (looksSoccer && !looksBasket) return "soccer";
-  if (looksBasket) return "basketball";
+  const hasInitials = /\b[A-Z]\.\s?[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]/.test(partido);
+  const hasPair = /\/|&/.test(partido);
+  const tennis = hasInitials || hasPair || /\bset|games?\b/i.test(partido);
+  const soccer = /\bfc\b|\breal\b|\batl[eé]tico\b|united|city|cf\b|inter|madrid|barcelona|arsenal|juventus|sassuolo|cagliari/i.test(p);
+  const basket = /\blakers|warriors|celtics|bucks|euroliga|euroleague|nba/i.test(p);
+  if (tennis && !soccer && !basket) return "tennis";
+  if (soccer && !basket) return "soccer";
+  if (basket) return "basketball";
   return "unknown";
 }
 
-// ===== OpenAI: enriquecimiento robusto (HOY→+3 días, JSON forzado, reintentos) =====
-async function enrichViaOpenAI(partido) {
-  if (!partido) return null;
-
-  const todayISO = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-  const sport = detectSport(partido);
-
-  async function oneTry(alt = 0) {
-    const sys = `
-Eres un asistente experto en deporte actual (fecha actual: ${todayISO}).
-Objetivo: Para el partido dado, responde SOLO si existe un encuentro programado para HOY, MAÑANA o como máximo en los PRÓXIMOS 3 DÍAS.
-Exige precisión:
-- "tournament": nombre OFICIAL y específico (ej.: "Swiss Indoors Basel (ATP 500)"; nunca "ATP Tour" genérico).
-- "tournamentTz": zona horaria IANA del torneo (ej.: "Europe/Zurich", "Europe/Madrid", "America/New_York").
-- "startLocal": fecha y hora LOCAL del torneo (ej.: "2025-10-30 19:00"), 24h sin zona.
-- "startIso": la misma hora convertida a UTC en ISO (ej.: "2025-10-30T18:00:00Z").
-- "confidence": 0..1.
-Si NO hay partido en la ventana (hoy → +3 días), devuelve:
-{ "tournament": null, "tournamentTz": null, "startLocal": null, "startIso": null, "confidence": 0.1 }.
-NO inventes. Si dudas del torneo o la hora exacta, devuelve startIso=null. Devuelve SOLO JSON válido.`.trim();
-
-    const user = `Partido: ${partido}.
-Deporte estimado: ${sport}.
-${alt === 0
-  ? `Busca si está programado para HOY, MAÑANA o los PRÓXIMOS 3 DÍAS. Evita partidos pasados (p. ej., Miami en marzo).`
-  : `Confirma SOLO partidos HOY/MAÑANA/+3 días. Si hay ambigüedad, devuelve startIso=null. Da el torneo OFICIAL (no "ATP Tour").`
-}`;
-
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o",
-      temperature: 0.0,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: user }
-      ]
-    });
-
-    return resp.choices?.[0]?.message?.content || "{}";
-  }
-
-  let raw = await oneTry(0);
-  let json = safeParseJson(raw) || {};
-
-  const now = Date.now();
-  const max = now + 3 * 24 * 60 * 60 * 1000; // +3 días
-  const invalidGenericTournament = (name) =>
-    !!(name && /atp tour|wta tour|tournament|league|liga/i.test(name) &&
-      !/\b(ATP|WTA|ITF|Challenger|Grand Slam|Masters|1000|500|250|Copa|Swiss Indoors|Basel|Madrid|Roma|Paris|Acapulco|Miami|Shanghai|Doha|Dubai|Barcelona|Monte-Carlo|Euroleague|LaLiga|Premier|Champions|Europa League)\b/i.test(name));
-
-  const fixJson = (j) => {
-    if (j?.startIso) {
-      const t = Date.parse(j.startIso);
-      if (isNaN(t) || t < now - 10 * 60 * 1000 || t > max) j.startIso = null; // tolerancia -10 min
-    }
-    if (invalidGenericTournament(j?.tournament)) j.tournament = null;
-    return j;
-  };
-
-  json = fixJson(json);
-
-  if (!json?.tournament || !json?.startIso) {
-    raw = await oneTry(1);
-    let json2 = safeParseJson(raw) || {};
-    json = fixJson(json2);
-  }
-
-  return json || null;
+// Descarga imagen y la convierte en data URL (evita que OpenAI tenga que salir a Internet)
+async function fetchImageAsDataUrl(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Error descargando imagen (${resp.status})`);
+  const ct = (resp.headers.get("content-type") || "image/jpeg").split(";")[0];
+  if (!/^image\//i.test(ct)) throw new Error(`La URL no devuelve una imagen (content-type: ${ct})`);
+  const buf = await resp.arrayBuffer();
+  const b64 = Buffer.from(buf).toString("base64");
+  return `data:${ct};base64,${b64}`;
 }
 
-// ===== OpenAI: extracción desde imagen =====
-async function parseImageWithOpenAI(image_url) {
+// ===== Enriquecimiento con navegación web (Responses + web_search) =====
+async function enrichViaWeb(partido, horaTexto = null) {
+  if (!USE_WEB) return null;
+  if (!partido) return null;
+
+  const todayISO = new Date().toISOString().slice(0, 10);
+  const sport = detectSport(partido);
+
+  const userPrompt = [
+    `Partido: ${partido}.`,
+    sport !== "unknown" ? `Deporte estimado: ${sport}.` : "",
+    horaTexto ? `Hora en el ticket (si es orientativa): ${horaTexto}.` : "",
+    `Necesito hora REAL (confirmada en web) y torneo específico.`,
+    `Ventana: HOY, MAÑANA o próximos 3 días desde ${todayISO}.`,
+    `Devuelve SOLO JSON válido, exacto:`,
+    `{
+  "tournament": "nombre oficial específico (p.ej. 'Serie A 2025/26' o 'Swiss Indoors Basel (ATP 500)')",
+  "tournamentTz": "IANA timezone (p.ej. 'Europe/Rome')",
+  "startLocal": "YYYY-MM-DD HH:mm (hora local torneo, 24h, sin zona)",
+  "startIso": "UTC en ISO (p.ej. '2025-10-30T17:30:00Z') o null si no hay partido próximo",
+  "confidence": 0..1,
+  "sources": ["url1","url2"]
+}`,
+    `No uses horarios por defecto; confirma con 1–3 fuentes fiables.`,
+  ].filter(Boolean).join("\n");
+
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "gpt-4o",            // browsing activo
+      input: userPrompt,
+      tools: [{
+        type: "web_search",
+        user_location: { country: "ES", timezone: "Europe/Madrid" },
+        search_context_size: "medium"
+      }],
+      tool_choice: "auto",
+      temperature: 0.0
+    })
+  });
+  const j = await r.json();
+  if (!r.ok) {
+    console.error("[web enrich] HTTP", r.status, j?.error?.message || j);
+    return null;
+  }
+
+  // Extrae el texto de salida
+  let textOut = "";
+  try {
+    const out = j.output || [];
+    const msg = out.find(o => o.type === "message") || out[out.length - 1] || {};
+    const contentArr = msg?.content || [];
+    const txt = contentArr.find(c => c.type === "output_text")?.text;
+    textOut = (txt || "").trim();
+  } catch (_) {}
+
+  let data = null;
+  try {
+    const s = textOut.indexOf("{"); const e = textOut.lastIndexOf("}");
+    data = JSON.parse(s >= 0 && e > s ? textOut.slice(s, e + 1) : textOut);
+  } catch (e) {
+    console.error("[web enrich] parse error:", e.message, "out:", textOut.slice(0, 400));
+    return null;
+  }
+
+  // Validaciones servidor: ventana temporal y torneo específico
+  const now = Date.now();
+  const max = now + 3 * 24 * 60 * 60 * 1000;
+  const looksGeneric = (name) =>
+    !!(name && /atp tour|wta tour|league|liga|tournament/i.test(name) &&
+      !/\b(ATP|WTA|ITF|Challenger|Grand Slam|Masters|1000|500|250|Copa|Serie A|LaLiga|Premier|Champions|Europa League|Basel|Madrid|Roma|Paris|Miami|Shanghai)\b/i.test(name));
+
+  if (data?.startIso) {
+    const t = Date.parse(data.startIso);
+    if (isNaN(t) || t < now - 10 * 60 * 1000 || t > max) data.startIso = null;
+  }
+  if (!data?.tournament || looksGeneric(data.tournament)) data.tournament = null;
+
+  return data;
+}
+
+// ===== Enriquecimiento sin web (fallback opcional) =====
+async function enrichViaOpenAI(partido) {
+  if (!USE_OPENAI) return null;
+  if (!partido) return null;
+
+  const todayISO = new Date().toISOString().slice(0, 10);
+  const sport = detectSport(partido);
+
+  // modelo sin browsing: sólo como “mejor esfuerzo”
+  const sys = `
+Eres un asistente de deporte (${todayISO}). Responde SOLO si hay partido HOY/MAÑANA/+3 días.
+JSON:
+{"tournament":"...","tournamentTz":"...","startLocal":"YYYY-MM-DD HH:mm","startIso":"...Z or null","confidence":0..1}
+Si dudas, startIso=null.`.trim();
+
+  const user = `Partido: ${partido}. Deporte estimado: ${sport}.`;
+
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.0,
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: user }
+    ]
+  });
+
+  const text = resp.choices?.[0]?.message?.content || "{}";
+  const data = safeParseJson(text) || {};
+  const now = Date.now();
+  const max = now + 3 * 24 * 60 * 60 * 1000;
+  if (data?.startIso) {
+    const t = Date.parse(data.startIso);
+    if (isNaN(t) || t < now - 10 * 60 * 1000 || t > max) data.startIso = null;
+  }
+  return data;
+}
+
+// ===== Extracción desde imagen (OCR+IE) =====
+async function parseImageWithOpenAI(image_url_or_data_url) {
   const prompt =
 `Extrae las selecciones del ticket de apuesta en JSON.
 Para cada selección devuelve:
-- "partido" (ej. "J. Sinner vs F. Cerúndolo" o parejas si es dobles)
+- "partido"
 - "torneo" (si aparece)
-- "fecha_hora_texto" (tal cual aparece: "Hoy 19:00", "Mañana 10:00", "30/10/2025 21:00")
-- "mercado" (ej. "Ganador", "Over/Under", etc.)
-- "apuesta" (ej. "J. Sinner", "Over 2.5 sets")
+- "fecha_hora_texto" (p.ej. "Hoy 19:00", "Mañana 10:00", "30/10/2025 21:00")
+- "mercado"
+- "apuesta"
 - "cuota" (número)
-- "casa_apuestas" (si aparece en el ticket)
+- "casa_apuestas" (si aparece)
 Responde SOLO con JSON: { "bookmaker": "...", "selections": [ ... ] }`;
 
   const resp = await openai.chat.completions.create({
@@ -177,7 +243,7 @@ Responde SOLO con JSON: { "bookmaker": "...", "selections": [ ... ] }`;
         role: "user",
         content: [
           { type: "text", text: prompt },
-          { type: "image_url", image_url: { url: image_url } }
+          { type: "image_url", image_url: { url: image_url_or_data_url } }
         ]
       }
     ]
@@ -192,27 +258,29 @@ Responde SOLO con JSON: { "bookmaker": "...", "selections": [ ... ] }`;
 // ===== Rutas =====
 app.get("/health", (_req, res) => res.type("text/plain").send("ok"));
 
+// Página raíz informativa (evita "Cannot GET /")
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("✅ TipsterChat Betslip Parser API online. Usa /health, /upload-url o /parse-rows.");
+});
+
+// Genera URL firmada de subida + URL pública en Supabase Storage
 app.post("/upload-url", async (req, res) => {
   const { filename } = req.body || {};
   if (!filename) return res.status(400).json({ error: "missing filename" });
 
   try {
-    // nombre del bucket (puedes cambiarlo si quieres)
-    const bucket = process.env.SUPABASE_BUCKET || "uploads";
-
-    // genera una URL firmada para subir la imagen directamente desde Lovable
+    const bucket = process.env.SUPABASE_BUCKET || "betslips";
     const { data, error } = await supabase.storage
       .from(bucket)
       .createSignedUploadUrl(filename);
 
     if (error) throw error;
 
-    // URL pública (para que OpenAI o tu backend pueda leerla)
     const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${bucket}/${encodeURIComponent(filename)}`;
 
-    res.json({
-      uploadUrl: data.signedUrl,
-      publicUrl
+    return res.json({
+      uploadUrl: data.signedUrl,   // PUT aquí el binario desde el front
+      publicUrl                    // esta URL pasa a /parse-rows
     });
   } catch (e) {
     console.error("upload-url error:", e);
@@ -220,8 +288,7 @@ app.post("/upload-url", async (req, res) => {
   }
 });
 
-
-// Procesa imagen, enriquece y guarda
+// Procesa imagen, enriquece y guarda en Supabase
 app.post("/parse-rows", async (req, res) => {
   try {
     const { image_url, tipster_id } = req.body || {};
@@ -229,10 +296,20 @@ app.post("/parse-rows", async (req, res) => {
       return res.status(400).json({ error: "missing fields: image_url, tipster_id" });
     }
 
-    // 1) Extraer selecciones del ticket
-    const parsed = await parseImageWithOpenAI(image_url);
+    // 1) Asegurar data URL para OpenAI (si viene URL http(s), la descargamos)
+    let imageSource;
+    try {
+      imageSource = image_url.startsWith("data:")
+        ? image_url
+        : await fetchImageAsDataUrl(image_url);
+    } catch (e) {
+      return res.status(400).json({ error: `Error while downloading ${image_url}: ${e.message}` });
+    }
 
-    // 2) Crear betslip
+    // 2) Extraer selecciones del ticket
+    const parsed = await parseImageWithOpenAI(imageSource);
+
+    // 3) Crear betslip
     const { data: slipIns, error: slipErr } = await supabase
       .from("betslips")
       .insert({
@@ -245,7 +322,7 @@ app.post("/parse-rows", async (req, res) => {
     if (slipErr) throw new Error(`supabase(betslips.insert): ${slipErr.message}`);
     const betslip_id = slipIns.id;
 
-    // 3) Para cada selección: normaliza, enriquece y guarda
+    // 4) Para cada selección: normaliza, enriquece (web → fallback) y guarda
     const rows = [];
     for (const sel of parsed.selections) {
       let { partido, torneo, fecha_hora_texto, mercado, apuesta, cuota } = sel || {};
@@ -255,12 +332,29 @@ app.post("/parse-rows", async (req, res) => {
       let fecha_hora_iso =
         toISOFromES(fecha_hora_texto) || resolveRelativeDate(fecha_hora_texto);
 
-      // Enriquecer (si falta torneo o ISO)
+      // Enriquecer si falta torneo/hora
       if ((!torneo || !fecha_hora_iso) && partido) {
-        const gpt = await enrichViaOpenAI(partido);
-        if (gpt) {
-          if (!torneo && gpt.tournament) torneo = gpt.tournament;
-          if (!fecha_hora_iso && gpt.startIso) fecha_hora_iso = gpt.startIso;
+        // 4.1 Web browsing real
+        if (USE_WEB) {
+          try {
+            const web = await enrichViaWeb(partido, fecha_hora_texto || null);
+            if (web) {
+              if (!torneo && web.tournament) torneo = web.tournament;
+              if (!fecha_hora_iso && web.startIso) fecha_hora_iso = web.startIso;
+            }
+          } catch (e) {
+            console.error("[enrich web] error:", e.message);
+          }
+        }
+        // 4.2 Fallback sin web (si lo activas por ENV)
+        if ((!torneo || !fecha_hora_iso) && USE_OPENAI) {
+          try {
+            const gpt = await enrichViaOpenAI(partido);
+            if (gpt) {
+              if (!torneo && gpt.tournament) torneo = gpt.tournament;
+              if (!fecha_hora_iso && gpt.startIso) fecha_hora_iso = gpt.startIso;
+            }
+          } catch (_) {}
         }
       }
 
@@ -286,7 +380,7 @@ app.post("/parse-rows", async (req, res) => {
         .single();
       if (selErr) throw new Error(`supabase(bet_selections.insert): ${selErr.message}`);
 
-      // Render local en el navegador del usuario
+      // Render “local” (el front lo convierte con toLocaleString)
       const visibleFecha = selIns.start_time_utc
         ? new Date(selIns.start_time_utc).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
         : (selIns.start_time_text || "(pendiente)");
@@ -294,14 +388,14 @@ app.post("/parse-rows", async (req, res) => {
       rows.push({
         "Partido": selIns.match || "",
         "Torneo": selIns.tournament || "",
-        "Fecha y hora": visibleFecha,          // local para el usuario
+        "Fecha y hora": visibleFecha,
         "Mercado": selIns.market || "",
         "Apuesta": selIns.pick || "",
         "Cuota": selIns.odds,
         "Casa de apuestas": selIns.bookmaker || "",
         _betslip_id: betslip_id,
         _selection_id: selIns.id,
-        _fecha_hora_iso: selIns.start_time_utc,     // UTC para persistir/editar
+        _fecha_hora_iso: selIns.start_time_utc,
         _fecha_hora_texto: selIns.start_time_text || ""
       });
     }
@@ -313,7 +407,7 @@ app.post("/parse-rows", async (req, res) => {
   }
 });
 
-// Edición de selección (guardar UTC en BBDD)
+// Edición de selección (guardar UTC, etc.)
 app.post("/update-selection", async (req, res) => {
   try {
     const { selection_id, torneo, fecha_hora_iso, mercado, apuesta, cuota, casa_apuestas, tipster_id } = req.body || {};
@@ -379,35 +473,19 @@ app.post("/update-stake", async (req, res) => {
   }
 });
 
-// Debug crudo (ver salida antes de filtros)
-app.get("/debug-enrich-raw", async (req, res) => {
+// Debug: salud y enriquecimientos
+app.get("/debug-enrich-web", async (req, res) => {
   try {
     const partido = req.query.partido || "";
+    const hora = req.query.hora || null;
     if (!partido) return res.status(400).json({ error: "missing partido" });
-    const todayISO = new Date().toISOString().slice(0, 10);
-    const sport = detectSport(partido);
-
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o",
-      temperature: 0.0,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: `Eres un experto en deporte (${todayISO}). Da partido si es HOY/MAÑANA/+3 días; si no, startIso=null. JSON estricto.` },
-        { role: "user", content: `Partido: ${partido}. Deporte estimado: ${sport}.` }
-      ]
-    });
-
-    res.json({
-      ok: true,
-      partido,
-      raw: resp.choices?.[0]?.message?.content || ""
-    });
+    const found = await enrichViaWeb(partido, hora);
+    res.json({ ok: true, partido, found });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Debug normal (con filtros aplicados)
 app.get("/debug-enrich", async (req, res) => {
   try {
     const partido = req.query.partido || "";
@@ -419,32 +497,9 @@ app.get("/debug-enrich", async (req, res) => {
   }
 });
 
-// === Prueba si tu cuenta tiene acceso a web search (sin forzar formato) ===
-app.get("/try-web", async (req, res) => {
-  try {
-    const query = req.query.q || "Cagliari vs Sassuolo horario";
-    const r = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        input: query,
-        tools: [{ type: "web_search" }],
-        tool_choice: "auto"
-      })
-    });
-    const json = await r.json();
-    res.status(r.ok ? 200 : 500).json(json);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // ===== Start =====
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`✅ Server running on port ${port}`));
+
 
 
