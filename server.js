@@ -4,6 +4,52 @@ import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 import { z } from "zod";
 
+// ---- CONFIG ----
+const BASE_TZ = process.env.BASE_TZ || "Europe/Madrid";
+
+// Bookmakers conocidos (añade/quita los que uses)
+const KNOWN_BOOKMAKERS = [
+  "bet365","betfair","pinnacle","william hill","betway","betsson","codere",
+  "sportium","marathonbet","bwin","1xbet","888sport","leovegas","caliente",
+  "playdoit","foliatti","daznbet","versus","kirolbet","retabet"
+];
+
+// ---- HELPERS ----
+const norm = s => (s||"").toString().trim().toLowerCase();
+
+// Si el “bookmaker” devuelto es el tipster o no está en la lista conocida → devuelve null
+function cleanBookmaker(rawBookmaker, tipsterId) {
+  const b = norm(rawBookmaker);
+  const t = norm(tipsterId);
+  if (!b) return null;
+  if (b.includes(t) || t.includes(b)) return null;
+  // intento de normalizar (quita “apuesta realizada en …”)
+  const cleaned = b.replace(/apuesta.*en\s*/i, "").replace(/[^\p{L}\p{N}\s]/gu,"").trim();
+  if (!cleaned) return null;
+  const isKnown = KNOWN_BOOKMAKERS.some(k => cleaned.includes(k));
+  return isKnown ? cleaned : null;
+}
+
+// Convierte "Mañana 06:30" u "Hoy 19:00" a Date ISO en time zone base.
+// Si no puede, devuelve null y deja el texto tal cual.
+function resolveRelativeDate(text, now = new Date()) {
+  if (!text) return null;
+  const m = text.toLowerCase().match(/(hoy|mañana)\s+(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  const [, rel, hh, mm] = m;
+  // construimos fecha en tz base
+  const nowTz = new Date(now.toLocaleString("en-US", { timeZone: BASE_TZ }));
+  const d = new Date(nowTz);
+  if (rel === "mañana") d.setDate(d.getDate() + 1);
+  d.setHours(parseInt(hh,10), parseInt(mm,10), 0, 0);
+  // volvemos a ISO en UTC
+  const iso = new Date(
+    Date.parse(d.toLocaleString("en-US", { timeZone: "UTC" }))
+  ).toISOString();
+  return iso;
+}
+
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "12mb" }));
@@ -42,6 +88,65 @@ const BetSlip = z.object({
   source_image_url: z.string().url(),
   confidence: z.coerce.number().nullable().optional()
 });
+
+// Cache sencilla en memoria para no machacar la API
+const matchCache = new Map(); // key -> { ts, data }
+const CACHE_MS = 5 * 60 * 1000;
+
+async function fetchJson(url) {
+  const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (!r.ok) throw new Error(`fetch ${url} -> ${r.status}`);
+  return await r.json();
+}
+
+// Intenta localizar torneo y hora exacta en SofaScore
+async function enrichTennisSelection(selection) {
+  const txt = selection.partido || "";
+  const names = Array.from(
+    new Set(
+      txt
+        .replace(/[-–—]/g, " ")
+        .split(/vs|\/|,|\(|\)|\s{2,}/i)
+        .map(s => s.trim())
+        .filter(Boolean)
+    )
+  ).slice(0, 4);
+
+  if (names.length === 0) return null;
+
+  const key = `tennis:${names.join("|")}`;
+  const cached = matchCache.get(key);
+  if (cached && Date.now() - cached.ts < CACHE_MS) return cached.data;
+
+  try {
+    const q = encodeURIComponent(names[0]);
+    const search = await fetchJson(`https://api.sofascore.com/api/v1/search/all?q=${q}`);
+    const tennis = (search?.tennis?.players || []).slice(0,3);
+
+    for (const p of tennis) {
+      const events = await fetchJson(`https://api.sofascore.com/api/v1/player/${p.id}/events/next/0`);
+      const list = (events?.events || []).filter(e => e?.tournament?.name);
+      for (const ev of list) {
+        const home = (ev?.homeTeam?.name || "").toLowerCase();
+        const away = (ev?.awayTeam?.name || "").toLowerCase();
+        const hay = names.filter(n => home.includes(n.toLowerCase()) || away.includes(n.toLowerCase())).length;
+
+        if (hay >= Math.min(2, names.length)) {
+          const tournament = ev.tournament.name;
+          const startUnix = ev.startTimestamp;
+          const startIso = startUnix ? new Date(startUnix * 1000).toISOString() : null;
+          const data = { tournament, startIso };
+          matchCache.set(key, { ts: Date.now(), data });
+          return data;
+        }
+      }
+    }
+  } catch (e) {
+    // ignora errores
+  }
+  return null;
+}
+
 
 /** 1) URL firmada para subir a Supabase Storage */
 app.post("/upload-url", async (req, res) => {
@@ -191,14 +296,12 @@ app.post("/parse-rows", async (req, res) => {
       return res.status(400).json({ error: "missing fields: image_url, tipster_id" });
     }
 
-    // Llama internamente a tu lógica existente de /parse
     const upstream = await fetch(`${req.protocol}://${req.get("host")}/parse`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ image_url, tipster_id })
     });
 
-    // Si /parse falló, propaga el error
     if (!upstream.ok) {
       const txt = await upstream.text();
       return res.status(502).json({ error: "upstream /parse error", detail: txt });
@@ -206,24 +309,43 @@ app.post("/parse-rows", async (req, res) => {
 
     const parsed = await upstream.json();
 
-    // Transforma el objeto en un ARRAY de filas para la tabla de Lovable
-    const rows = (parsed.selections || []).map((sel) => ({
-      "Partido": sel.partido,
-      "Torneo": sel.torneo || "",
-      "Fecha y hora": sel.fecha_hora_iso
-        ? new Date(sel.fecha_hora_iso).toLocaleString("es-ES", { dateStyle: "medium", timeStyle: "short" })
-        : (sel.fecha_hora_texto || ""),
-      "Mercado": sel.mercado,
-      "Apuesta": sel.apuesta,
-      "Cuota": sel.cuota,
-      "Casa de apuestas": sel.casa_apuestas || parsed.bookmaker || ""
-    }));
+    const rows = [];
+    for (const sel of (parsed.selections || [])) {
+      let fechaISO = sel.fecha_hora_iso || null;
+      if (!fechaISO && sel.fecha_hora_texto) {
+        const iso = resolveRelativeDate(sel.fecha_hora_texto);
+        if (iso) fechaISO = iso;
+      }
 
-    return res.status(200).json(rows); // 👈 array puro
+      try {
+        const found = await enrichTennisSelection({ partido: sel.partido });
+        if (found) {
+          if (!fechaISO && found.startIso) fechaISO = found.startIso;
+          if (!sel.torneo && found.tournament) sel.torneo = found.tournament;
+        }
+      } catch {}
+
+      const casa = cleanBookmaker(sel.casa_apuestas || parsed.bookmaker, tipster_id);
+
+      rows.push({
+        "Partido": sel.partido,
+        "Torneo": sel.torneo || "",
+        "Fecha y hora": fechaISO
+          ? new Date(fechaISO).toLocaleString("es-ES", { dateStyle: "medium", timeStyle: "short" })
+          : (sel.fecha_hora_texto || ""),
+        "Mercado": sel.mercado,
+        "Apuesta": sel.apuesta,
+        "Cuota": sel.cuota,
+        "Casa de apuestas": casa || ""
+      });
+    }
+
+    return res.status(200).json(rows);
   } catch (e) {
     return res.status(500).json({ error: e.message || String(e) });
   }
 });
+
 
 app.get("/health", (_req, res) => res.send("ok"));
 const PORT = process.env.PORT || 3000;
