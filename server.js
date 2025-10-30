@@ -333,7 +333,27 @@ async function enrichGenericSelection(selection) {
   }
 
   logD("no match", { leftVars, rightVars });
-  return null;
+// === Fallback final: búsqueda en internet ===
+try {
+  const baseUrl = process.env.SELF_URL || "https://betslip-parser.onrender.com";
+  const url = `${baseUrl}/enrich-online?partido=${encodeURIComponent(selection.partido)}`;
+  const r = await fetch(url);
+  if (r.ok) {
+    const data = await r.json();
+    if (data?.found?.tournament) {
+      logD("found via web search", data.found);
+      return {
+        tournament: data.found.tournament,
+        startIso: data.found.startIso || null
+      };
+    }
+  }
+} catch (e) {
+  console.log("[ENRICH web fallback error]", e.message);
+}
+
+logD("no match", { leftVars, rightVars });
+return null;
 }
 
 // ============== VALIDACIÓN (Zod) ==============
@@ -653,6 +673,40 @@ app.get("/debug-enrich", async (req, res) => {
     return res.status(500).json({ error: e.message || String(e) });
   }
 });
+
+// === Enriquecimiento online: busca torneo y hora en internet ===
+app.get("/enrich-online", async (req, res) => {
+  const partido = req.query.partido;
+  if (!partido) return res.status(400).json({ error: "Missing ?partido=" });
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `Eres un asistente que busca información deportiva en Internet.
+Devuelve JSON con las claves: tournament (nombre del torneo o liga), startIso (fecha y hora ISO en UTC si existe), y confidence (0 a 1).`
+        },
+        {
+          role: "user",
+          content: `Busca el torneo y la hora exacta del partido ${partido}.`
+        }
+      ],
+      tools: [
+        { type: "web_search" } // 🔍 permite búsqueda en internet
+      ]
+    });
+
+    const text = completion.choices[0].message?.content || "{}";
+    const json = JSON.parse(text);
+    res.json({ ok: true, partido, found: json });
+  } catch (e) {
+    console.error("❌ enrich-online error", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 
 // ============== HEALTH & LISTEN ==============
 app.get("/health", (_req, res) => res.send("ok"));
