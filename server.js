@@ -61,6 +61,17 @@ function resolveRelativeDate(text, now = new Date()) {
   return iso;
 }
 
+// Quita acentos/diacríticos y baja a minúsculas
+function normalizePlain(s) {
+  return (s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\./g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 // ===== Debug =====
 const ENRICH_DEBUG = process.env.ENRICH_DEBUG === "true";
 const logD = (...args) => ENRICH_DEBUG && console.log("[ENRICH]", ...args);
@@ -155,88 +166,175 @@ async function fetchJson(url) {
  */
 async function enrichGenericSelection(selection) {
   const base = "https://api.sofascore.com/api/v1";
-  const variants = nameVariants(selection.partido);
-  if (!variants.length) return null;
+  const raw = selection.partido || "";
+  if (!raw) return null;
 
-  const cacheKey = `generic:${variants.join("|")}`;
-  const cached = matchCache.get(cacheKey);
-  if (cached && Date.now() - cached.ts < CACHE_MS) {
-    logD("cache hit", cacheKey, cached.data);
-    return cached.data;
-  }
-
-  logD("search variants", variants);
-
-  let candidates = [];
-  // 1) Buscar por varias variantes hasta encontrar candidatos
-  for (const name of variants) {
-    try {
-      const q = encodeURIComponent(name);
-      const url = `${base}/search/all?q=${q}`;
-      const search = await fetchJsonWithTimeout(url, 6000);
-      // recolecta players & teams de todas las secciones
-      for (const section of Object.values(search || {})) {
-        if (!section || typeof section !== "object") continue;
-        if (Array.isArray(section.players)) {
-          section.players.slice(0, 3).forEach(p => candidates.push({ type: "player", id: p.id, n: name }));
-        }
-        if (Array.isArray(section.teams)) {
-          section.teams.slice(0, 3).forEach(t => candidates.push({ type: "team", id: t.id, n: name }));
-        }
-      }
-      if (candidates.length) {
-        logD("found candidates for", name, candidates.slice(0, 5));
-        break;
-      }
-    } catch (e) {
-      logD("search fail", name, String(e));
-    }
-  }
-
-  // Si no hay candidatos aún, intento “todo a pelo” con la primera palabra
-  if (!candidates.length && variants[0]) {
-    logD("no candidates; giving up");
+  // 1) Separa los dos lados del partido por "vs"
+  const sides = raw.split(/vs/i).map(s => s.trim()).filter(Boolean);
+  if (sides.length < 2) {
+    logD("no 'vs' in match text", raw);
     return null;
   }
 
-  // 2) Probar próximos eventos de esos candidatos
-  for (const c of candidates.slice(0, 10)) {
-    try {
-      const url =
-        c.type === "team"
-          ? `${base}/team/${c.id}/events/next/0`
-          : `${base}/player/${c.id}/events/next/0`;
-      const data = await fetchJsonWithTimeout(url, 6000);
-      const events = Array.isArray(data?.events) ? data.events : [];
-      for (const ev of events) {
-        const home = (ev?.homeTeam?.name || "").toLowerCase();
-        const away = (ev?.awayTeam?.name || "").toLowerCase();
-        // cuenta cuántas variantes “casan” con home/away
-        const hits = variants.filter(v => {
-          const s = v.toLowerCase();
-          return home.includes(s) || away.includes(s);
-        }).length;
+  // 2) Normaliza y crea variantes (nombre sin iniciales + apellido)
+  function expandName(side) {
+    // Ej: "J. Sinner" -> ["J Sinner", "Sinner"]
+    const plain = normalizePlain(side);
+    // tokens >= 2
+    const tokens = plain.split(/\s+/).filter(Boolean);
+    const variants = new Set();
 
-        if (hits >= Math.min(2, variants.length)) {
-          const tournament = ev?.tournament?.name || ev?.season?.name || "";
-          const startIso = ev?.startTimestamp
-            ? new Date(ev.startTimestamp * 1000).toISOString()
-            : null;
-          const result = { tournament, startIso };
-          matchCache.set(cacheKey, { ts: Date.now(), data: result });
-          logD("match!", { variants, tournament, startIso, eventId: ev.id });
-          return result;
+    if (tokens.length >= 2) {
+      // quita iniciales de 1 carácter
+      const noInitials = tokens.filter(t => t.length > 1).join(" ");
+      if (noInitials) variants.add(noInitials);
+      // añade sólo el último token (suele ser apellido)
+      variants.add(tokens[tokens.length - 1]);
+    } else {
+      variants.add(plain);
+    }
+    return Array.from(variants);
+  }
+
+  // Corrige casos comunes de apellidos con/ sin tilde
+  function addDiacriticAlternatives(v) {
+    const out = new Set([v]);
+    if (v.includes("cerundolo")) out.add(v.replace("cerundolo", "cerúndolo"));
+    if (v.includes("alcaraz")) out.add(v.replace("alcaraz", "álcaraz")); // por si acaso
+    // añade más reglas si lo necesitas
+    return Array.from(out);
+  }
+
+  const leftVars  = expandName(sides[0]).flatMap(addDiacriticAlternatives);
+  const rightVars = expandName(sides[1]).flatMap(addDiacriticAlternatives);
+
+  // 3) Primero intenta una búsqueda combinada (ambos apellidos)
+  const combinedQueries = [];
+  for (const a of leftVars) for (const b of rightVars) {
+    combinedQueries.push(`${a} ${b}`);
+  }
+
+  async function searchAll(q) {
+    const url = `${base}/search/all?q=${encodeURIComponent(q)}`;
+    return await fetchJsonWithTimeout(url, 6000);
+  }
+
+  // 4) Intenta encontrar IDs de jugadores de TENIS para cada lado
+  async function topTennisCandidates(q) {
+    const res = await searchAll(q);
+    // Prioriza sección de tenis si existe
+    const tennis = res?.tennis;
+    const fromTennis =
+      (tennis?.players || []).map(p => ({ type: "player", id: p.id, name: p.name })).slice(0, 5);
+
+    if (fromTennis.length) return fromTennis;
+
+    // Si no hay sección de tenis, abre a todo (por si el index cambia)
+    const generic = [];
+    for (const section of Object.values(res || {})) {
+      if (!section || typeof section !== "object") continue;
+      if (Array.isArray(section.players)) {
+        section.players.slice(0, 3).forEach(p => generic.push({ type: "player", id: p.id, name: p.name }));
+      }
+      if (Array.isArray(section.teams)) {
+        section.teams.slice(0, 3).forEach(t => generic.push({ type: "team", id: t.id, name: t.name }));
+      }
+    }
+    return generic.slice(0, 5);
+  }
+
+  // 5) Dado un playerId, trae próximos eventos
+  async function nextEventsForPlayer(id) {
+    const url = `${base}/player/${id}/events/next/0`;
+    const data = await fetchJsonWithTimeout(url, 6000);
+    return Array.isArray(data?.events) ? data.events : [];
+  }
+
+  // === Estrategia A: búsqueda combinada y cruce de eventos ===
+  for (const combo of combinedQueries.slice(0, 6)) {
+    try {
+      const candLeft  = await topTennisCandidates(combo);
+      const candRight = candLeft; // con query combinada lo normal es que estén ambos
+      // Trae eventos de los primeros 3 jugadores detectados
+      const eventsById = {};
+      for (const c of candLeft.slice(0, 3)) {
+        const evs = await nextEventsForPlayer(c.id);
+        eventsById[c.id] = evs;
+      }
+      // Busca un evento donde aparezca *otra* variante del segundo lado
+      for (const evs of Object.values(eventsById)) {
+        for (const ev of evs) {
+          const home = normalizePlain(ev?.homeTeam?.name || "");
+          const away = normalizePlain(ev?.awayTeam?.name || "");
+          // ¿Contiene apellidos/variantes de ambos lados?
+          const hasLeft  = leftVars.some(v => home.includes(normalizePlain(v)) || away.includes(normalizePlain(v)));
+          const hasRight = rightVars.some(v => home.includes(normalizePlain(v)) || away.includes(normalizePlain(v)));
+          if (hasLeft && hasRight) {
+            const tournament = ev?.tournament?.name || ev?.season?.name || "";
+            const startIso   = ev?.startTimestamp ? new Date(ev.startTimestamp * 1000).toISOString() : null;
+            logD("A-match", combo, tournament, startIso);
+            return { tournament, startIso };
+          }
         }
       }
     } catch (e) {
-      logD("events fail", c, String(e));
+      logD("A-fail", combo, String(e));
     }
   }
 
-  logD("no match for", variants);
+  // === Estrategia B: buscar cada lado por separado y cruzar agendas ===
+  async function firstCandidatesOrNull(vars) {
+    for (const v of vars) {
+      try {
+        const list = await topTennisCandidates(v);
+        if (list.length) return list.slice(0, 3);
+      } catch (e) {
+        logD("B-search-fail", v, String(e));
+      }
+    }
+    return null;
+  }
+
+  const leftCands  = await firstCandidatesOrNull(leftVars);
+  const rightCands = await firstCandidatesOrNull(rightVars);
+
+  if (!leftCands || !rightCands) {
+    logD("B-no-cands", { leftVars, rightVars });
+    return null;
+  }
+
+  // Trae eventos próximos de ambos lados y busca intersección (mismo eventId o vs por nombres)
+  const leftEventsPromises  = leftCands.map(c => nextEventsForPlayer(c.id));
+  const rightEventsPromises = rightCands.map(c => nextEventsForPlayer(c.id));
+  const leftEventsLists  = await Promise.allSettled(leftEventsPromises);
+  const rightEventsLists = await Promise.allSettled(rightEventsPromises);
+
+  const leftEvents  = leftEventsLists.flatMap(p => p.status === "fulfilled" ? (p.value || []) : []);
+  const rightEvents = rightEventsLists.flatMap(p => p.status === "fulfilled" ? (p.value || []) : []);
+
+  // Índice rápido por normalización de "home vs away"
+  function sig(ev) {
+    const h = normalizePlain(ev?.homeTeam?.name || "");
+    const a = normalizePlain(ev?.awayTeam?.name || "");
+    return h < a ? `${h} vs ${a}` : `${a} vs ${h}`;
+  }
+  const rightIndex = new Map(rightEvents.map(ev => [sig(ev), ev]));
+
+  for (const ev of leftEvents) {
+    const key = sig(ev);
+    if (rightIndex.has(key)) {
+      const twin = rightIndex.get(key);
+      const startUnix = ev.startTimestamp || twin.startTimestamp;
+      const tournament = ev?.tournament?.name || twin?.tournament?.name || ev?.season?.name || twin?.season?.name || "";
+      const startIso = startUnix ? new Date(startUnix * 1000).toISOString() : null;
+      logD("B-match", { key, tournament, startIso });
+      return { tournament, startIso };
+    }
+  }
+
+  logD("no match", { leftVars, rightVars });
   return null;
 }
-
 
 // ============== VALIDACIÓN (Zod) ==============
 const SelectionSchema = z.object({
