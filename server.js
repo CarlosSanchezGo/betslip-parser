@@ -434,7 +434,7 @@ app.get("/try-web", async (req, res) => {
         input: query,
         tools: [{ type: "web_search" }],
         tool_choice: "auto",
-        response_format: { type: "json_object" }
+        text: { format: "json" } // 👈 nuevo formato correcto
       })
     });
     const json = await r.json();
