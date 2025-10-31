@@ -436,48 +436,49 @@ app.post("/close-betslip", async (req, res) => {
 app.get("/list-betslips", async (req, res) => {
   try {
     const { tipster_id } = req.query;
-    if (!tipster_id) return res.status(400).json({ error: "missing tipster_id" });
+    if (!tipster_id) {
+      console.error("Missing tipster_id in query");
+      return res.status(400).json({ error: "missing tipster_id" });
+    }
 
-    // 1) Carga slips
-    const { data: slips, error: e1 } = await supabase
+    // 1️⃣ Bet slips
+    const { data: slips, error: slipsError } = await supabase
       .from("betslips")
-      .select("id, created_at, stake, currency, resultado, resultado_texto, closed_at, tipster_id")
+      .select("id, tipster_id, created_at, stake, currency, resultado, resultado_texto, closed_at")
       .eq("tipster_id", tipster_id)
       .order("created_at", { ascending: false });
 
-    if (e1) {
-      console.error("[list-betslips] slips error:", e1);
-      return res.status(500).json({ error: e1.message || "slips error" });
+    if (slipsError) {
+      console.error("Supabase slips error:", slipsError.message);
+      return res.status(500).json({ error: slipsError.message });
     }
 
-    if (!slips || slips.length === 0) return res.json([]);
+    if (!slips || slips.length === 0) {
+      return res.json([]); // no apuestas aún
+    }
 
-    // 2) Carga selections en bloque (evita nested select)
-    const ids = slips.map(s => s.id).filter(Boolean);
-    if (ids.length === 0) return res.json(slips.map(s => ({ ...s, bet_selections: [] })));
-
-    const { data: sels, error: e2 } = await supabase
+    // 2️⃣ Bet selections
+    const slipIds = slips.map(s => s.id).filter(Boolean);
+    const { data: selections, error: selError } = await supabase
       .from("bet_selections")
       .select("id, betslip_id, match, tournament, start_time_utc, start_time_text, market, pick, odds, bookmaker")
-      .in("betslip_id", ids);
+      .in("betslip_id", slipIds);
 
-    if (e2) {
-      console.error("[list-betslips] selections error:", e2);
-      // aunque fallen selecciones, devolvemos slips vacíos para no romper la UI
+    if (selError) {
+      console.error("Supabase selections error:", selError.message);
       return res.json(slips.map(s => ({ ...s, bet_selections: [] })));
     }
 
-    // 3) Agrupa
-    const bySlip = new Map(slips.map(s => [s.id, { ...s, bet_selections: [] }]));
-    for (const r of (sels || [])) {
-      const group = bySlip.get(r.betslip_id);
-      if (group) group.bet_selections.push(r);
-    }
+    // 3️⃣ Agrupar
+    const grouped = slips.map(slip => ({
+      ...slip,
+      bet_selections: selections.filter(sel => sel.betslip_id === slip.id)
+    }));
 
-    res.json(Array.from(bySlip.values()));
+    return res.json(grouped);
   } catch (err) {
-    console.error("[list-betslips] fatal:", err);
-    res.status(500).json({ error: err.message || String(err) });
+    console.error("list-betslips fatal:", err);
+    return res.status(500).json({ error: err.message || "Unknown server error" });
   }
 });
 
