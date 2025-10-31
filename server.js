@@ -1,11 +1,10 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 
 // =====================
-// Config básica
+// Config
 // =====================
 const app = express();
 app.use(cors({ origin: true }));
@@ -86,39 +85,16 @@ function safeParseJson(text) {
     if (s >= 0 && e > s) try { return JSON.parse(text.slice(s, e + 1)); } catch {}
     return null;
   }
-// Detecta si un texto de fecha es ambiguo (sin año o con día de la semana)
-function isAmbiguousDate(text) {
-  if (!text) return true;
-  const t = String(text).toLowerCase().trim();
-  const hasYear = /\b(20\d{2})\b/.test(t);
-  const hasESlike = /\b(\d{1,2})\s*(\/|-)\s*(\d{1,2})\s*(\/|-)\s*(20\d{2})\b/.test(t); // dd/mm/yyyy
-  const hasWeekday = /\b(lun|mar|mié|mie|jue|vie|sáb|sab|dom|mon|tue|wed|thu|fri|sat|sun)\b/.test(t);
-  // Ej: "Jue, 30 Oct 13:45" → ambiguo
-  return !hasYear && !hasESlike || hasWeekday;
 }
 
-// Si “torneo” trae mercados típicos, los reasigna a mercado
-function sanitizeTournamentAndMarket(torneo, mercado) {
-  const BAD_AS_TOURNAMENT = [
-    "1x2","1X2","ganador","handicap","hándicap","handicap por sets",
-    "moneyline","over/under","ou","total goles","especiales","specials"
-  ].map(s=>s.toLowerCase());
-  const tor = (torneo||"").toLowerCase().trim();
-  if (tor && BAD_AS_TOURNAMENT.includes(tor)) {
-    // mover a mercado si mercado está vacío
-    return { torneo: null, mercado: mercado || torneo };
-  }
-  return { torneo, mercado };
-}
-
-// =======================================================
-// NUEVO: Enrichment verificado con allow-list de dominios
-// =======================================================
+// =====================
+// NUEVO: enrichment verificado (allow-list)
+// =====================
 const dedupeSpaces = s => (s || "").replace(/\s+/g, " ").trim();
 function normalizeMatchName(raw) {
   if (!raw) return null;
   let s = dedupeSpaces(raw);
-  s = s.replace(/\s*[-–—]\s*/g, " vs "); // “A - B” → “A vs B”
+  s = s.replace(/\s*[-–—]\s*/g, " vs ");
   return s;
 }
 const SOURCE_ALLOWLIST = {
@@ -128,6 +104,41 @@ const SOURCE_ALLOWLIST = {
 };
 const pickDomains = sport => SOURCE_ALLOWLIST[(sport||"").toLowerCase()] || SOURCE_ALLOWLIST.default;
 const isAllowed = (url, domains) => { try { const u=new URL(url); return domains.some(d=>u.hostname.endsWith(d)); } catch { return false; } };
+
+// Mapa simple de TZ por torneo/competición (para mostrar bonito)
+const TOURNAMENT_TZ_MAP = {
+  "laliga": "Europe/Madrid",
+  "la liga": "Europe/Madrid",
+  "serie a": "Europe/Rome",
+  "bundesliga": "Europe/Berlin",
+  "ligue 1": "Europe/Paris",
+  "premier league": "Europe/London",
+  "uefa": "Europe/Zurich",
+  "atp": "Europe/Paris",
+  "wta": "Europe/Paris",
+  "roland garros": "Europe/Paris",
+  "paris masters": "Europe/Paris",
+};
+function inferTzFromTournament(tournament) {
+  if (!tournament) return null;
+  const t = String(tournament).toLowerCase();
+  for (const key of Object.keys(TOURNAMENT_TZ_MAP)) {
+    if (t.includes(key)) return TOURNAMENT_TZ_MAP[key];
+  }
+  return null;
+}
+function toLocalInTz(isoUtc, tz) {
+  if (!isoUtc || !tz) return null;
+  try {
+    const d = new Date(isoUtc);
+    return new Intl.DateTimeFormat("es-ES", {
+      timeZone: tz,
+      dateStyle: "medium",
+      timeStyle: "short",
+      hour12: false
+    }).format(d);
+  } catch { return null; }
+}
 
 async function findFixtureVerified(partidoRaw, sport) {
   const partido = normalizeMatchName(partidoRaw);
@@ -158,21 +169,23 @@ Formato JSON:
       input: prompt,
       tools: [{ type: "web_search", user_location: { type: "approximate", country: "ES", timezone: "Europe/Madrid" } }],
       tool_choice: "auto",
-      temperature: 0.1,
-    }),
+      temperature: 0.1
+    })
   });
+
   if (!r.ok) {
     const t = await r.text();
     console.error("[verified enrich] HTTP", r.status, t);
     return { tournament:null,startIso:null,tz:null,sourceUrl:null };
   }
-  const j = await r.json();
 
+  const j = await r.json();
   let text=""; try {
     const out = j.output || [];
     const msg = out.find(o=>o.type==="message") || out[out.length-1] || {};
     text = (msg.content?.find(c=>c.type==="output_text")?.text || "").trim();
   } catch {}
+
   const s = text.indexOf("{"), e = text.lastIndexOf("}");
   if (s<0 || e<=s) return { tournament:null,startIso:null,tz:null,sourceUrl:null };
 
@@ -184,18 +197,55 @@ Formato JSON:
     tournament: obj.tournament || null,
     startIso: obj.startIso || null,
     tz: obj.tz || null,
-    sourceUrl: obj.sourceUrl || null,
+    sourceUrl: obj.sourceUrl || null
   };
 }
 
 async function enrichViaWeb(partido, horaTexto = null, sport = null) {
   if (!USE_WEB) return null;
   try {
-    return await findFixtureVerified(partido, sport);
+    const inputOrder = cleanPartido(partido);
+    const found = await findFixtureVerified(partido, sport);
+    if (!found) return null;
+    let tz = found.tz && found.tz !== "UTC" ? found.tz : inferTzFromTournament(found.tournament) || null;
+    const startLocal = (found.startIso && tz) ? toLocalInTz(found.startIso, tz) : null;
+    return {
+      tournament: found.tournament || null,
+      tournamentTz: tz || null,
+      startLocal,
+      startIso: found.startIso || null,
+      confidence: found.startIso ? 0.9 : 0.0,
+      sources: found.sourceUrl ? [found.sourceUrl] : [],
+      partido_input: inputOrder
+    };
   } catch (err) {
     console.error("[enrichViaWeb] error:", err.message);
     return null;
   }
+}
+
+// =====================
+// Helpers para OCR sucio
+// =====================
+function isAmbiguousDate(text) {
+  if (!text) return true;
+  const t = String(text).toLowerCase().trim();
+  const hasYear = /\b(20\d{2})\b/.test(t);
+  const hasESlike = /\b(\d{1,2})\s*(\/|-)\s*(\d{1,2})\s*(\/|-)\s*(20\d{2})\b/.test(t);
+  const hasWeekday = /\b(lun|mar|mié|mie|jue|vie|sáb|sab|dom|mon|tue|wed|thu|fri|sat|sun)\b/.test(t);
+  return (!hasYear && !hasESlike) || hasWeekday;
+}
+
+function sanitizeTournamentAndMarket(torneo, mercado) {
+  const BAD_AS_TOURNAMENT = [
+    "1x2","ganador","handicap","hándicap","handicap por sets",
+    "moneyline","over/under","ou","total goles","especiales","specials"
+  ].map(s=>s.toLowerCase());
+  const tor = (torneo||"").toLowerCase().trim();
+  if (tor && BAD_AS_TOURNAMENT.includes(tor)) {
+    return { torneo: null, mercado: mercado || torneo };
+  }
+  return { torneo, mercado };
 }
 
 // =====================
@@ -250,7 +300,6 @@ app.post("/parse-rows", async (req, res) => {
     const parsed = await parseImageWithOpenAI(imageSource);
     if (!Array.isArray(parsed.selections)) return res.json([]);
 
-    // crea betslip
     const { data: slip, error: slipErr } = await supabase
       .from("betslips")
       .insert({
@@ -264,68 +313,66 @@ app.post("/parse-rows", async (req, res) => {
     const betslip_id = slip.id;
 
     const rows = [];
-for (const sel of parsed.selections) {
-  let { partido, torneo, fecha_hora_texto, mercado, apuesta, cuota } = sel || {};
-  partido = cleanPartido(partido);
+    for (const sel of parsed.selections) {
+      let { partido, torneo, fecha_hora_texto, mercado, apuesta, cuota } = sel || {};
+      partido = cleanPartido(partido);
 
-  // 2.1 Corregir “1x2” mal puesto en torneo
-  ({ torneo, mercado } = sanitizeTournamentAndMarket(torneo, mercado));
+      // corrige "1x2" mal en torneo
+      ({ torneo, mercado } = sanitizeTournamentAndMarket(torneo, mercado));
 
-  // 2.2 Casa de apuestas
-  const casa_raw = sel?.casa_apuestas || parsed.bookmaker || null;
-  const casa_apuestas = cleanBookmaker(casa_raw, tipster_id);
+      const casa_raw = sel?.casa_apuestas || parsed.bookmaker || null;
+      const casa_apuestas = cleanBookmaker(casa_raw, tipster_id);
 
-  // 2.3 Hora desde imagen (solo si NO es ambigua)
-  let fecha_hora_iso = null;
-  if (!isAmbiguousDate(fecha_hora_texto)) {
-    fecha_hora_iso = toISOFromES(fecha_hora_texto) || resolveRelativeDate(fecha_hora_texto);
-  }
+      // Hora desde imagen sólo si no es ambigua
+      let fecha_hora_iso = null;
+      if (!isAmbiguousDate(fecha_hora_texto)) {
+        fecha_hora_iso = toISOFromES(fecha_hora_texto) || resolveRelativeDate(fecha_hora_texto);
+      }
 
-  // 2.4 Enriquecimiento web SIEMPRE que falte torneo o fecha UTC
-  //     (el flag USE_WEB_ENRICH ya no bloquea)
-  if (partido && (!torneo || !fecha_hora_iso)) {
-    const web = await enrichViaWeb(partido, fecha_hora_texto, /* sport opcional */ "football");
-    if (web) {
-      if (!torneo && web.tournament) torneo = web.tournament;
-      if (!fecha_hora_iso && web.startIso) fecha_hora_iso = web.startIso;
+      // Enrichment web si falta torneo u hora
+      if (partido && (!torneo || !fecha_hora_iso)) {
+        const web = await enrichViaWeb(partido, fecha_hora_texto, sport || "football");
+        if (web) {
+          if (!torneo && web.tournament) torneo = web.tournament;
+          if (!fecha_hora_iso && web.startIso) fecha_hora_iso = web.startIso;
+        }
+      }
+
+      const oddsNumber = parseFloat(String(cuota || "").replace(",", "."));
+      const insertObj = {
+        betslip_id,
+        match: partido || null,
+        tournament: torneo || null,
+        start_time_utc: fecha_hora_iso || null,
+        start_time_text: fecha_hora_iso ? null : (fecha_hora_texto || null),
+        market: mercado || null,
+        pick: apuesta || null,
+        odds: Number.isFinite(oddsNumber) ? oddsNumber : null,
+        bookmaker: casa_apuestas || null
+      };
+
+      const { data: selIns, error: selErr } = await supabase
+        .from("bet_selections")
+        .insert(insertObj)
+        .select("id, match, tournament, start_time_utc, start_time_text, market, pick, odds, bookmaker")
+        .single();
+      if (selErr) throw selErr;
+
+      rows.push({
+        "Partido": selIns.match,
+        "Torneo": selIns.tournament,
+        "Fecha y hora": selIns.start_time_utc
+          ? new Date(selIns.start_time_utc).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
+          : selIns.start_time_text,
+        "Mercado": selIns.market,
+        "Apuesta": selIns.pick,
+        "Cuota": selIns.odds,
+        "Casa de apuestas": selIns.bookmaker,
+        _betslip_id: betslip_id,
+        _selection_id: selIns.id
+      });
     }
-  }
 
-  // 2.5 Insertar selección
-  const oddsNumber = parseFloat(String(cuota || "").replace(",", "."));
-  const insertObj = {
-    betslip_id,
-    match: partido || null,
-    tournament: torneo || null,
-    start_time_utc: fecha_hora_iso || null,
-    start_time_text: fecha_hora_iso ? null : (fecha_hora_texto || null),
-    market: mercado || null,
-    pick: apuesta || null,
-    odds: Number.isFinite(oddsNumber) ? oddsNumber : null,
-    bookmaker: casa_apuestas || null
-  };
-
-  const { data: selIns, error: selErr } = await supabase
-    .from("bet_selections")
-    .insert(insertObj)
-    .select("id, match, tournament, start_time_utc, start_time_text, market, pick, odds, bookmaker")
-    .single();
-  if (selErr) throw selErr;
-
-  rows.push({
-    "Partido": selIns.match,
-    "Torneo": selIns.tournament,
-    "Fecha y hora": selIns.start_time_utc
-      ? new Date(selIns.start_time_utc).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
-      : selIns.start_time_text,
-    "Mercado": selIns.market,
-    "Apuesta": selIns.pick,
-    "Cuota": selIns.odds,
-    "Casa de apuestas": selIns.bookmaker,
-    _betslip_id: betslip_id,
-    _selection_id: selIns.id
-  });
-}
     res.json(rows);
   } catch (e) {
     console.error("parse-rows error:", e);
@@ -333,94 +380,80 @@ for (const sel of parsed.selections) {
   }
 });
 
-// Debug enrichment (para probar desde navegador)
+// Debug enrichment
 app.get("/debug-enrich-web", async (req, res) => {
   try {
     const raw = req.query.partido || "";
     const partido = cleanPartido(raw);
     const sport = req.query.sport || null;
     if (!partido) return res.status(400).json({ error: "missing partido" });
+
     const found = await enrichViaWeb(partido, null, sport);
-    res.json({ ok: true, partido, found });
+    res.json({
+      ok: true,
+      partido: partido,
+      found: found || {
+        tournament: null,
+        tournamentTz: null,
+        startLocal: null,
+        startIso: null,
+        confidence: 0,
+        sources: []
+      }
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ✅ Actualiza una selección (tabla bet_selections) — robusto ES/EN
+// Actualiza selección (robusto ES/EN)
 app.post("/update-selection", async (req, res) => {
   try {
-    // Acepta español e inglés
     const {
       selection_id,
       tipster_id,
-
-      // español
-      torneo,            // -> tournament
-      fecha_hora_iso,    // -> start_time_utc
-      mercado,           // -> market
-      apuesta,           // -> pick
-      cuota,             // -> odds
-      casa_apuestas,     // -> bookmaker
-
-      // inglés
-      tournament,
-      start_time_utc,    // alternativa si ya viene en UTC
-      market,
-      pick,
-      odds,
-      bookmaker,
+      torneo, fecha_hora_iso, mercado, apuesta, cuota, casa_apuestas,
+      tournament, start_time_utc, market, pick, odds, bookmaker
     } = req.body || {};
 
-    if (!selection_id) {
-      return res.status(400).json({ error: "missing selection_id" });
-    }
+    if (!selection_id) return res.status(400).json({ error: "missing selection_id" });
 
-    // Normaliza campos priorizando ES, con fallback a EN
     const norm = {
-      tournament : typeof torneo          !== "undefined" ? torneo          : tournament,
-      startIso   : typeof fecha_hora_iso  !== "undefined" ? fecha_hora_iso  : start_time_utc,
-      market     : typeof mercado         !== "undefined" ? mercado         : market,
-      pick       : typeof apuesta         !== "undefined" ? apuesta         : pick,
-      odds       : typeof cuota           !== "undefined" ? cuota           : odds,
-      bookmaker  : typeof casa_apuestas   !== "undefined" ? casa_apuestas   : bookmaker,
+      tournament : typeof torneo         !== "undefined" ? torneo         : tournament,
+      startIso   : typeof fecha_hora_iso !== "undefined" ? fecha_hora_iso : start_time_utc,
+      market     : typeof mercado        !== "undefined" ? mercado        : market,
+      pick       : typeof apuesta        !== "undefined" ? apuesta        : pick,
+      odds       : typeof cuota          !== "undefined" ? cuota          : odds,
+      bookmaker  : typeof casa_apuestas  !== "undefined" ? casa_apuestas  : bookmaker,
     };
 
-    // Limpieza y coerción
     const patch = {};
     if (typeof norm.tournament !== "undefined") patch.tournament = norm.tournament || null;
 
     if (typeof norm.startIso !== "undefined") {
       patch.start_time_utc = norm.startIso ? new Date(norm.startIso).toISOString() : null;
-      if (patch.start_time_utc) patch.start_time_text = null; // si hay UTC, limpiamos texto
+      if (patch.start_time_utc) patch.start_time_text = null;
     }
 
-    if (typeof norm.market !== "undefined")   patch.market = norm.market || null;
-    if (typeof norm.pick   !== "undefined")   patch.pick   = norm.pick   || null;
+    if (typeof norm.market !== "undefined") patch.market = norm.market || null;
+    if (typeof norm.pick   !== "undefined") patch.pick   = norm.pick   || null;
 
-    if (typeof norm.odds   !== "undefined") {
+    if (typeof norm.odds !== "undefined") {
       const v = typeof norm.odds === "number" ? norm.odds : parseFloat(String(norm.odds).replace(",", "."));
       patch.odds = Number.isFinite(v) ? v : null;
     }
 
     if (typeof norm.bookmaker !== "undefined") {
       const n = String(norm.bookmaker || "").toLowerCase();
-      if (tipster_id && n.includes(String(tipster_id).toLowerCase())) {
-        patch.bookmaker = null; // evita confundir tipster con casa
-      } else if (n.includes("tipster")) {
-        patch.bookmaker = null;
-      } else {
-        patch.bookmaker = norm.bookmaker || null;
-      }
+      if (tipster_id && n.includes(String(tipster_id).toLowerCase())) patch.bookmaker = null;
+      else if (n.includes("tipster")) patch.bookmaker = null;
+      else patch.bookmaker = norm.bookmaker || null;
     }
 
     if (Object.keys(patch).length === 0) {
       return res.status(400).json({ error: "no fields to update" });
     }
 
-    console.log("🔧 /update-selection", { selection_id, patch });
-
-    // Usa maybeSingle() para no romper si 0 o >1 filas (y lo gestionamos a mano)
     const { data, error } = await supabase
       .from("bet_selections")
       .update(patch)
@@ -428,14 +461,8 @@ app.post("/update-selection", async (req, res) => {
       .select("id, betslip_id, match, tournament, start_time_utc, start_time_text, market, pick, odds, bookmaker")
       .maybeSingle();
 
-    if (error) {
-      console.error("supabase update error:", error);
-      return res.status(500).json({ error: error.message });
-    }
-    if (!data) {
-      // 0 filas afectadas
-      return res.status(404).json({ error: "selection_id not found", selection_id });
-    }
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data)  return res.status(404).json({ error: "selection_id not found", selection_id });
 
     return res.json({ ok: true, selection: data });
   } catch (e) {
@@ -444,7 +471,7 @@ app.post("/update-selection", async (req, res) => {
   }
 });
 
-// ✅ Actualiza stake/moneda de un ticket (tabla betslips)
+// Actualiza stake/moneda en betslips
 app.post("/update-stake", async (req, res) => {
   try {
     const { betslip_id, stake, currency } = req.body || {};
@@ -472,14 +499,11 @@ app.post("/update-stake", async (req, res) => {
   }
 });
 
-// 🟢 Listar todas las apuestas del tipster (con selecciones)
+// Listar apuestas del tipster (con selecciones)
 app.get("/list-betslips", async (req, res) => {
   try {
     const { tipster_id } = req.query;
-    if (!tipster_id) {
-      console.error("Missing tipster_id in query");
-      return res.status(400).json({ error: "missing tipster_id" });
-    }
+    if (!tipster_id) return res.status(400).json({ error: "missing tipster_id" });
 
     const { data: slips, error: slipsError } = await supabase
       .from("betslips")
@@ -487,14 +511,8 @@ app.get("/list-betslips", async (req, res) => {
       .eq("tipster_id", tipster_id)
       .order("created_at", { ascending: false });
 
-    if (slipsError) {
-      console.error("Supabase slips error:", slipsError.message);
-      return res.status(500).json({ error: slipsError.message });
-    }
-
-    if (!slips || slips.length === 0) {
-      return res.json([]);
-    }
+    if (slipsError) return res.status(500).json({ error: slipsError.message });
+    if (!slips || slips.length === 0) return res.json([]);
 
     const slipIds = slips.map(s => s.id).filter(Boolean);
     const { data: selections, error: selError } = await supabase
@@ -519,10 +537,10 @@ app.get("/list-betslips", async (req, res) => {
   }
 });
 
-// 🔴 Eliminar apuesta completa
+// Eliminar apuesta completa
 app.delete("/delete-betslip", async (req, res) => {
   try {
-    const { betslip_id } = req.body;
+    const { betslip_id } = req.body || {};
     if (!betslip_id) return res.status(400).json({ error: "missing betslip_id" });
     await supabase.from("bet_selections").delete().eq("betslip_id", betslip_id);
     await supabase.from("betslips").delete().eq("id", betslip_id);
@@ -532,9 +550,9 @@ app.delete("/delete-betslip", async (req, res) => {
   }
 });
 
-// 🟡 Buscar resultado en internet
+// Buscar resultado en internet
 app.get("/check-result", async (req, res) => {
-  console.log("🟢 Versión correcta de /check-result cargada");
+  console.log("🟢 /check-result");
   try {
     const { partido, pick } = req.query;
     if (!partido) return res.status(400).json({ error: "missing partido" });
@@ -560,14 +578,7 @@ Reglas:
         model: "gpt-4o",
         input: prompt,
         tools: [
-          {
-            type: "web_search",
-            user_location: {
-              type: "approximate",
-              country: "ES",
-              timezone: "Europe/Madrid",
-            },
-          },
+          { type: "web_search", user_location: { type: "approximate", country: "ES", timezone: "Europe/Madrid" } }
         ],
         tool_choice: "auto",
         temperature: 0.2,
@@ -593,24 +604,16 @@ Reglas:
     const e = text.lastIndexOf("}");
     const parsed = s >= 0 && e > s ? JSON.parse(text.slice(s, e + 1)) : null;
 
-    res.json(
-      parsed || {
-        finished: false,
-        score: null,
-        status: null,
-        confidence: 0,
-        sources: [],
-      }
-    );
+    res.json(parsed || { finished:false, score:null, status:null, confidence:0, sources:[] });
   } catch (err) {
     console.error("❌ /check-result error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// 🟣 Cerrar apuesta con resultado confirmado
+// Cerrar apuesta con resultado confirmado
 app.post("/close-betslip", async (req, res) => {
-  const { betslip_id, resultado, resultado_texto } = req.body;
+  const { betslip_id, resultado, resultado_texto } = req.body || {};
   if (!betslip_id || !resultado) return res.status(400).json({ error: "missing params" });
   const { data, error } = await supabase
     .from("betslips")
