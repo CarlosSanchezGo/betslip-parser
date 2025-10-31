@@ -313,58 +313,99 @@ app.get("/debug-enrich-web", async (req, res) => {
   }
 });
 
-// ✅ Actualiza una selección (tabla bet_selections)
+// ✅ Actualiza una selección (tabla bet_selections) — robusto ES/EN
 app.post("/update-selection", async (req, res) => {
   try {
+    // Acepta español e inglés
     const {
       selection_id,
       tipster_id,
-      torneo,
-      fecha_hora_iso,
-      mercado,
-      apuesta,
-      cuota,
-      casa_apuestas
+
+      // español
+      torneo,            // -> tournament
+      fecha_hora_iso,    // -> start_time_utc
+      mercado,           // -> market
+      apuesta,           // -> pick
+      cuota,             // -> odds
+      casa_apuestas,     // -> bookmaker
+
+      // inglés
+      tournament,
+      start_time_utc,    // alternativa si ya viene en UTC
+      market,
+      pick,
+      odds,
+      bookmaker,
     } = req.body || {};
 
     if (!selection_id) {
       return res.status(400).json({ error: "missing selection_id" });
     }
 
-    const _cleanBookmaker = (name, tid) => {
-      if (!name) return null;
-      const n = String(name).toLowerCase();
-      if (tid && n.includes(String(tid).toLowerCase())) return null;
-      if (n.includes("tipster")) return null;
-      return name;
+    // Normaliza campos priorizando ES, con fallback a EN
+    const norm = {
+      tournament : typeof torneo          !== "undefined" ? torneo          : tournament,
+      startIso   : typeof fecha_hora_iso  !== "undefined" ? fecha_hora_iso  : start_time_utc,
+      market     : typeof mercado         !== "undefined" ? mercado         : market,
+      pick       : typeof apuesta         !== "undefined" ? apuesta         : pick,
+      odds       : typeof cuota           !== "undefined" ? cuota           : odds,
+      bookmaker  : typeof casa_apuestas   !== "undefined" ? casa_apuestas   : bookmaker,
     };
 
+    // Limpieza y coerción
     const patch = {};
-    if (typeof torneo !== "undefined") patch.tournament = torneo || null;
-    if (typeof fecha_hora_iso !== "undefined") {
-      patch.start_time_utc = fecha_hora_iso ? new Date(fecha_hora_iso).toISOString() : null;
-      if (patch.start_time_utc) patch.start_time_text = null;
-    }
-    if (typeof mercado !== "undefined") patch.market = mercado || null;
-    if (typeof apuesta !== "undefined") patch.pick = apuesta || null;
-    if (typeof cuota !== "undefined") {
-      const v = typeof cuota === "number" ? cuota : parseFloat(String(cuota).replace(",", "."));
-      patch.odds = Number.isFinite(v) ? v : null;
-    }
-    if (typeof casa_apuestas !== "undefined") {
-      patch.bookmaker = _cleanBookmaker(casa_apuestas, tipster_id);
+    if (typeof norm.tournament !== "undefined") patch.tournament = norm.tournament || null;
+
+    if (typeof norm.startIso !== "undefined") {
+      patch.start_time_utc = norm.startIso ? new Date(norm.startIso).toISOString() : null;
+      if (patch.start_time_utc) patch.start_time_text = null; // si hay UTC, limpiamos texto
     }
 
+    if (typeof norm.market !== "undefined")   patch.market = norm.market || null;
+    if (typeof norm.pick   !== "undefined")   patch.pick   = norm.pick   || null;
+
+    if (typeof norm.odds   !== "undefined") {
+      const v = typeof norm.odds === "number" ? norm.odds : parseFloat(String(norm.odds).replace(",", "."));
+      patch.odds = Number.isFinite(v) ? v : null;
+    }
+
+    if (typeof norm.bookmaker !== "undefined") {
+      const n = String(norm.bookmaker || "").toLowerCase();
+      if (tipster_id && n.includes(String(tipster_id).toLowerCase())) {
+        patch.bookmaker = null; // evita confundir tipster con casa
+      } else if (n.includes("tipster")) {
+        patch.bookmaker = null;
+      } else {
+        patch.bookmaker = norm.bookmaker || null;
+      }
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ error: "no fields to update" });
+    }
+
+    console.log("🔧 /update-selection", { selection_id, patch });
+
+    // Usa maybeSingle() para no romper si 0 o >1 filas (y lo gestionamos a mano)
     const { data, error } = await supabase
       .from("bet_selections")
       .update(patch)
       .eq("id", selection_id)
-      .select("id, match, tournament, start_time_utc, start_time_text, market, pick, odds, bookmaker")
-      .single();
+      .select("id, betslip_id, match, tournament, start_time_utc, start_time_text, market, pick, odds, bookmaker")
+      .maybeSingle();
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) {
+      console.error("supabase update error:", error);
+      return res.status(500).json({ error: error.message });
+    }
+    if (!data) {
+      // 0 filas afectadas
+      return res.status(404).json({ error: "selection_id not found", selection_id });
+    }
+
     return res.json({ ok: true, selection: data });
   } catch (e) {
+    console.error("update-selection fatal:", e);
     return res.status(500).json({ error: e.message || String(e) });
   }
 });
