@@ -85,6 +85,50 @@ function safeParseJson(text) {
     if (s >= 0 && e > s) try { return JSON.parse(text.slice(s, e + 1)); } catch {}
     return null;
   }
+function parseScoreToAB(scoreStr) {
+  if (!scoreStr) return null;
+  const m = String(scoreStr).trim().match(/(\d+)\s*[-–:]\s*(\d+)/);
+  if (!m) return null;
+  return { a: Number(m[1]), b: Number(m[2]) };
+}
+
+function normName(s) {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFD").replace(/\p{Diacritic}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Calcula estado para 1X2/Ganador usando equipos y marcador A-B
+function decideStatusBasic({ market, pick, scoreAB, teams }) {
+  const mkt = normName(market || "");
+  const p   = normName(pick   || "");
+  const left  = normName(teams?.left  || "");
+  const right = normName(teams?.right || "");
+
+  if (!scoreAB) return { status: null, reason: "no score" };
+
+  // ¿Es un mercado de 1X2/Ganador?
+  const is1x2 = /(1x2|1 x 2|ganador|resultado final)/.test(mkt);
+  if (!is1x2) return { status: null, reason: "unsupported market" };
+
+  const { a, b } = scoreAB;
+  if (a === b) {
+    // Empate
+    if (/\b(x|empate|draw)\b/.test(p)) return { status: "Ganada",  reason: "empate y pick X" };
+    return                               { status: "Perdida", reason: "empate y pick no es X" };
+  }
+  const winner = a > b ? "left" : "right";
+  if (winner === "left") {
+    if (left && p.includes(left))  return { status: "Ganada",  reason: "ganó el equipo/jugador elegido" };
+    if (right && p.includes(right)) return { status: "Perdida", reason: "perdió el equipo/jugador elegido" };
+  } else {
+    if (right && p.includes(right)) return { status: "Ganada",  reason: "ganó el equipo/jugador elegido" };
+    if (left && p.includes(left))   return { status: "Perdida", reason: "perdió el equipo/jugador elegido" };
+  }
+  return { status: null, reason: "no pude mapear pick con teams" };
+}
 }
 
 // =====================
@@ -638,7 +682,30 @@ Reglas:
         sources: okSources
       });
     }
+    // ...
+    // scoreStr desde parsed.score o de las sources validadas
+    const scoreStr = parsed.score || (okSources.find(s => s.score)?.score || null);
+    const scoreAB  = parseScoreToAB(scoreStr);
 
+    // Si frontend manda market & pick, resolvemos estado
+    let statusBlock = { status: null, reason: "sin market/pick" };
+    if (req.query.market && req.query.pick && scoreAB) {
+      statusBlock = decideStatusBasic({
+        market: req.query.market,
+        pick:   req.query.pick,
+        scoreAB,
+        teams:  parsed.teams || { left: "", right: "" }
+      });
+    }
+return res.json({
+  finished: true,
+  score: scoreStr,
+  status: statusBlock.status,   // ← ahora viene “Ganada/Perdida/Nula” si procede
+  reason: statusBlock.reason,
+  teams: parsed.teams || { left: "", right: "" },
+  sources: okSources
+});
+    
     // Devuelve el veredicto base (la UI seguirá pidiendo confirmación)
     return res.json({
       finished: true,
