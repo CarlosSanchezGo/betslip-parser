@@ -550,24 +550,35 @@ app.delete("/delete-betslip", async (req, res) => {
   }
 });
 
-// Buscar resultado en internet
+// ===== Confirmación de resultado priorizando las mismas fuentes que el enrichment =====
 app.get("/check-result", async (req, res) => {
-  console.log("🟢 /check-result");
   try {
-    const { partido, pick } = req.query;
+    const { partido, pick, market, sport } = req.query;
     if (!partido) return res.status(400).json({ error: "missing partido" });
 
-    const prompt = `Busca si el partido "${decodeURIComponent(
-      partido
-    )}" ya terminó HOY o AYER.
-Devuelve SOLO JSON:
-{"finished":true|false,"score":"x-y|null","status":"Ganada|Perdida|Nula|null","confidence":0..1,"sources":["url1","url2"]}
+    // Usa la misma allow-list que el enrichment
+    const domains = pickDomains(sport); // de SOURCE_ALLOWLIST
+    const domainsLine = domains.join(", ");
+
+    const prompt = `
+Confirma si el partido "${decodeURIComponent(partido)}" YA TERMINÓ (hoy o ayer) y cuál fue el MARCADOR FINAL.
+Debes usar EXCLUSIVAMENTE estas fuentes (priorízalas en este orden): ${domainsLine}
+
+Responde SOLO en JSON, sin texto extra, con este formato exacto:
+{
+  "finished": true|false,
+  "score": "A-B|null",
+  "teams": {"left":"NombreLocal","right":"NombreVisitante"},
+  "sources": [{"url":"https://...", "score":"A-B|null"}]
+}
 
 Reglas:
-- Si no terminó: finished=false, el resto null.
-- Determina status respecto al pick del apostante (si se proporciona: "${pick || ""}"). 
-- Si no puedes determinar, status=null.`;
+- "finished" solo true si una de las fuentes de la lista confirma el final y el marcador.
+- Si no hay confirmación clara en esas fuentes, finished=false y score=null.
+- Máximo 3 sources. URLs reales, no resúmenes.
+`;
 
+    // Llamada a OpenAI con web_search
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
@@ -577,37 +588,69 @@ Reglas:
       body: JSON.stringify({
         model: "gpt-4o",
         input: prompt,
-        tools: [
-          { type: "web_search", user_location: { type: "approximate", country: "ES", timezone: "Europe/Madrid" } }
-        ],
+        tools: [{
+          type: "web_search",
+          user_location: { type: "approximate", country: "ES", timezone: "Europe/Madrid" }
+        }],
         tool_choice: "auto",
-        temperature: 0.2,
+        temperature: 0.1
       }),
     });
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`OpenAI error: ${text}`);
+      const txt = await response.text();
+      return res.status(502).json({ error: `OpenAI ${response.status}: ${txt}` });
     }
+    const ai = await response.json();
 
-    const result = await response.json();
+    // Extraer el texto y parsear JSON
     let text = "";
     try {
-      const out = result.output || [];
+      const out = ai.output || [];
       const msg = out.find(o => o.type === "message") || out[out.length - 1] || {};
       text = (msg.content?.find(c => c.type === "output_text")?.text || "").trim();
-    } catch (err) {
-      console.warn("⚠️ parse text failed:", err);
+    } catch {}
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch { parsed = null; }
+
+    // Si no hay JSON parseable, devolvemos neutral
+    if (!parsed) {
+      return res.json({ finished:false, score:null, status:null, reason:"No JSON parseable", sources:[] });
     }
 
-    const s = text.indexOf("{");
-    const e = text.lastIndexOf("}");
-    const parsed = s >= 0 && e > s ? JSON.parse(text.slice(s, e + 1)) : null;
+    // Filtrar las fuentes a la allow-list (misma validación que enrichment)
+    const sources = Array.isArray(parsed.sources) ? parsed.sources : [];
+    const okSources = sources.filter(s => {
+      try {
+        const host = new URL(s.url).hostname;
+        return domains.some(d => host.endsWith(d));
+      } catch { return false; }
+    }).slice(0, 3);
 
-    res.json(parsed || { finished:false, score:null, status:null, confidence:0, sources:[] });
+    // Si no hay fuentes válidas o no está confirmado, no cerramos
+    if (!parsed.finished || okSources.length === 0) {
+      return res.json({
+        finished: false,
+        score: null,
+        status: null,
+        reason: "Sin confirmación en fuentes priorizadas",
+        teams: parsed.teams || { left: "", right: "" },
+        sources: okSources
+      });
+    }
+
+    // Devuelve el veredicto base (la UI seguirá pidiendo confirmación)
+    return res.json({
+      finished: true,
+      score: parsed.score || (okSources.find(s => s.score)?.score || null),
+      status: null, // la UI puede decidir según market/pick o pedir confirmación
+      reason: "Confirmado en fuentes priorizadas",
+      teams: parsed.teams || { left: "", right: "" },
+      sources: okSources
+    });
   } catch (err) {
-    console.error("❌ /check-result error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("❌ /check-result allowlist error:", err);
+    return res.status(500).json({ error: err.message || String(err) });
   }
 });
 
