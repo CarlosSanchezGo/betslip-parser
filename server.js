@@ -433,6 +433,119 @@ app.post("/close-betslip", async (req, res) => {
   res.json({ ok: true, betslip: data });
 });
 
+// 🟢 Lista betslips + sus selecciones (sin nested select)
+app.get("/list-betslips", async (req, res) => {
+  try {
+    const { tipster_id } = req.query;
+    if (!tipster_id) return res.status(400).json({ error: "missing tipster_id" });
+
+    // 1) Carga slips
+    const { data: slips, error: e1 } = await supabase
+      .from("betslips")
+      .select("id, created_at, stake, currency, resultado, resultado_texto, closed_at")
+      .eq("tipster_id", tipster_id)
+      .order("created_at", { ascending: false });
+    if (e1) throw e1;
+
+    if (!slips?.length) return res.json([]);
+
+    // 2) Carga selections en bloque
+    const ids = slips.map(s => s.id);
+    const { data: sels, error: e2 } = await supabase
+      .from("bet_selections")
+      .select("id, betslip_id, match, tournament, start_time_utc, start_time_text, market, pick, odds, bookmaker")
+      .in("betslip_id", ids)
+      .order("id", { ascending: true });
+    if (e2) throw e2;
+
+    // 3) Agrupa
+    const bySlip = new Map();
+    for (const s of slips) bySlip.set(s.id, { ...s, bet_selections: [] });
+    for (const r of (sels || [])) {
+      const group = bySlip.get(r.betslip_id);
+      if (group) group.bet_selections.push(r);
+    }
+
+    res.json(Array.from(bySlip.values()));
+  } catch (err) {
+    console.error("/list-betslips error:", err);
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// 🔴 Eliminar betslip (borra selecciones por FK ON DELETE CASCADE)
+app.delete("/delete-betslip", async (req, res) => {
+  try {
+    const { betslip_id } = req.body || {};
+    if (!betslip_id) return res.status(400).json({ error: "missing betslip_id" });
+    const { error } = await supabase.from("betslips").delete().eq("id", betslip_id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("delete-betslip:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 🟡 Chequear resultado por web (devuelve propuesta)
+app.get("/check-result", async (req, res) => {
+  try {
+    const { partido, pick } = req.query;
+    if (!partido) return res.status(400).json({ error: "missing partido" });
+
+    const prompt = `Busca si el partido "${decodeURIComponent(partido)}" ya terminó HOY/AYER.
+Devuelve SOLO JSON:
+{"finished":true|false,"score":"x-y|null","status":"Ganada|Perdida|Nula|null","confidence":0..1,"sources":["url1","url2"]}
+
+Reglas:
+- Si no terminó: finished=false, el resto null.
+- Determina status respecto al pick del apostante (si se proporciona: "${pick||''}"). Si no puedes, status=null.`;
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        input: prompt,
+        tools: [{ type: "web_search", user_location: { type: "approximate", country: "ES", timezone: "Europe/Madrid" } }],
+        tool_choice: "auto",
+        temperature: 0.1
+      })
+    });
+    const j = await r.json();
+    let text = "";
+    try {
+      const out = j.output || [];
+      const msg = out.find(o => o.type === "message") || out[out.length-1] || {};
+      text = (msg.content?.find(c => c.type === "output_text")?.text || "").trim();
+    } catch {}
+    const s = text.indexOf("{"), e = text.lastIndexOf("}");
+    const data = s>=0 && e>s ? JSON.parse(text.slice(s, e+1)) : null;
+    res.json(data || { finished: false, score: null, status: null, confidence: 0 });
+  } catch (e) {
+    console.error("check-result:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 🟣 Cerrar betslip (guardar resultado confirmado)
+app.post("/close-betslip", async (req, res) => {
+  try {
+    const { betslip_id, resultado, resultado_texto } = req.body || {};
+    if (!betslip_id || !resultado) return res.status(400).json({ error: "missing params" });
+    const { data, error } = await supabase
+      .from("betslips")
+      .update({ resultado, resultado_texto: resultado_texto || null, closed_at: new Date().toISOString() })
+      .eq("id", betslip_id)
+      .select("id, resultado, resultado_texto, closed_at")
+      .single();
+    if (error) throw error;
+    res.json({ ok: true, betslip: data });
+  } catch (e) {
+    console.error("close-betslip:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`✅ Server running on port ${port}`));
 
