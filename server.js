@@ -283,6 +283,91 @@ app.get("/debug-enrich-web", async (req, res) => {
   }
 });
 
+// ✅ Actualiza una selección (tabla bet_selections)
+app.post("/update-selection", async (req, res) => {
+  try {
+    const {
+      selection_id,
+      tipster_id,        // opcional, lo usamos para limpiar bookmaker si coincide con el tipster
+      torneo,            // -> tournament
+      fecha_hora_iso,    // -> start_time_utc (UTC ISO)
+      mercado,           // -> market
+      apuesta,           // -> pick
+      cuota,             // -> odds (número)
+      casa_apuestas      // -> bookmaker
+    } = req.body || {};
+
+    if (!selection_id) {
+      return res.status(400).json({ error: "missing selection_id" });
+    }
+
+    // helper mínimo por si no lo tienes ya
+    const cleanBookmaker = (name, tid) => {
+      if (!name) return null;
+      const n = String(name).toLowerCase();
+      if (tid && n.includes(String(tid).toLowerCase())) return null; // evita confundir tipster con casa
+      if (n.includes("tipster")) return null;
+      return name;
+    };
+
+    const patch = {};
+    if (typeof torneo !== "undefined") patch.tournament = torneo || null;
+    if (typeof fecha_hora_iso !== "undefined") {
+      patch.start_time_utc = fecha_hora_iso ? new Date(fecha_hora_iso).toISOString() : null;
+      if (patch.start_time_utc) patch.start_time_text = null; // si hay UTC, limpiamos texto
+    }
+    if (typeof mercado !== "undefined") patch.market = mercado || null;
+    if (typeof apuesta !== "undefined") patch.pick = apuesta || null;
+    if (typeof cuota !== "undefined") {
+      const v = typeof cuota === "number" ? cuota : parseFloat(String(cuota).replace(",", "."));
+      patch.odds = Number.isFinite(v) ? v : null;
+    }
+    if (typeof casa_apuestas !== "undefined") {
+      patch.bookmaker = cleanBookmaker(casa_apuestas, tipster_id);
+    }
+
+    const { data, error } = await supabase
+      .from("bet_selections")
+      .update(patch)
+      .eq("id", selection_id)
+      .select("id, match, tournament, start_time_utc, start_time_text, market, pick, odds, bookmaker")
+      .single();
+
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ ok: true, selection: data });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+// ✅ Actualiza stake/moneda de un ticket (tabla betslips)
+app.post("/update-stake", async (req, res) => {
+  try {
+    const { betslip_id, stake, currency } = req.body || {};
+    if (!betslip_id) return res.status(400).json({ error: "missing betslip_id" });
+
+    const stakeNum =
+      stake === null || typeof stake === "undefined"
+        ? null
+        : (typeof stake === "number" ? stake : parseFloat(String(stake).replace(",", ".")));
+
+    const { data, error } = await supabase
+      .from("betslips")
+      .update({
+        stake: stakeNum !== null && Number.isFinite(stakeNum) ? stakeNum : null,
+        currency: currency || null
+      })
+      .eq("id", betslip_id)
+      .select("id, stake, currency")
+      .single();
+
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ ok: true, betslip: data });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`✅ Server running on port ${port}`));
 
