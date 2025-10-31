@@ -396,6 +396,7 @@ app.delete("/delete-betslip", async (req, res) => {
 
 // 🟡 Buscar resultado en internet
 app.get("/check-result", async (req, res) => {
+  console.log("🟢 Versión correcta de /check-result cargada"); 
   try {
     const { partido, pick } = req.query;
     if (!partido) return res.status(400).json({ error: "missing partido" });
