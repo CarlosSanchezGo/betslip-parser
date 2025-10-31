@@ -368,6 +368,71 @@ app.post("/update-stake", async (req, res) => {
   }
 });
 
+// 🟢 Listar todas las apuestas del tipster
+app.get("/list-betslips", async (req, res) => {
+  const { tipster_id } = req.query;
+  if (!tipster_id) return res.status(400).json({ error: "missing tipster_id" });
+  const { data, error } = await supabase
+    .from("betslips")
+    .select("id, created_at, stake, currency, resultado, resultado_texto, bet_selections (id, match, tournament, start_time_utc, market, pick, odds, bookmaker)")
+    .eq("tipster_id", tipster_id)
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// 🔴 Eliminar apuesta completa
+app.delete("/delete-betslip", async (req, res) => {
+  try {
+    const { betslip_id } = req.body;
+    if (!betslip_id) return res.status(400).json({ error: "missing betslip_id" });
+    await supabase.from("bet_selections").delete().eq("betslip_id", betslip_id);
+    await supabase.from("betslips").delete().eq("id", betslip_id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 🟡 Buscar resultado en internet
+app.get("/check-result", async (req, res) => {
+  try {
+    const { partido } = req.query;
+    if (!partido) return res.status(400).json({ error: "missing partido" });
+
+    // Usa OpenAI con web search
+    const completion = await openai.responses.create({
+      model: "gpt-4o-mini",
+      tool_choice: "auto",
+      tools: [{ type: "web_search" }],
+      input: `Busca el resultado final del partido ${partido}. Indica si ya terminó y si fue ganado, perdido o nulo desde el punto de vista de apuestas.`,
+    });
+
+    const text = completion.output_text || "";
+    res.json({ finished: true, result: text });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 🟣 Cerrar apuesta con resultado confirmado
+app.post("/close-betslip", async (req, res) => {
+  const { betslip_id, resultado, resultado_texto } = req.body;
+  if (!betslip_id || !resultado) return res.status(400).json({ error: "missing params" });
+  const { data, error } = await supabase
+    .from("betslips")
+    .update({
+      resultado,
+      resultado_texto,
+      closed_at: new Date().toISOString(),
+    })
+    .eq("id", betslip_id)
+    .select("id, resultado, resultado_texto, closed_at")
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true, betslip: data });
+});
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`✅ Server running on port ${port}`));
 
