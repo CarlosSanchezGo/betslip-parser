@@ -186,7 +186,20 @@ async function parseImageWithOpenAI(image_url_or_data_url) {
 // ===== ROUTES =====
 app.get("/health", (_req, res) => res.send("ok"));
 
-// 🟢 CONFIRMAR RESULTADO (PRIORITIZA FUENTES Y CALCULA ESTADO)
+// 🟢 Debug enrich web
+app.get("/debug-enrich-web", async (req, res) => {
+  try {
+    const partido = req.query.partido ? cleanPartido(req.query.partido) : null;
+    if (!partido) return res.status(400).json({ error: "missing partido" });
+    const sport = req.query.sport || "football";
+    const found = await enrichViaWeb(partido, null, sport);
+    res.json({ ok: true, partido, found });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 🟡 Check result (prioriza fuentes)
 app.get("/check-result", async (req, res) => {
   try {
     const { partido, pick, market, sport } = req.query;
@@ -196,7 +209,6 @@ app.get("/check-result", async (req, res) => {
     const prompt = `
 Confirma si el partido "${decodeURIComponent(partido)}" YA TERMINÓ (hoy o ayer) y cuál fue el MARCADOR FINAL.
 Debes usar EXCLUSIVAMENTE estas fuentes (priorízalas): ${domains.join(", ")}.
-
 Responde SOLO en JSON:
 {
   "finished": true|false,
@@ -236,7 +248,6 @@ Responde SOLO en JSON:
 
     const scoreStr = parsed.score || (okSources.find(s => s.score)?.score || null);
     const scoreAB = parseScoreToAB(scoreStr);
-
     let statusBlock = { status: null, reason: "sin market/pick" };
     if (req.query.market && req.query.pick && scoreAB) {
       statusBlock = decideStatusBasic({
@@ -256,10 +267,160 @@ Responde SOLO en JSON:
       sources: okSources
     });
   } catch (err) {
-    console.error("❌ /check-result error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ✅ Upload + parse
+app.post("/parse-rows", async (req, res) => {
+  try {
+    const { image_url, tipster_id } = req.body || {};
+    if (!image_url || !tipster_id) return res.status(400).json({ error: "missing fields" });
+
+    const imageSource = image_url.startsWith("data:") ? image_url : await fetchImageAsDataUrl(image_url);
+    const parsed = await parseImageWithOpenAI(imageSource);
+    if (!Array.isArray(parsed.selections)) return res.json([]);
+
+    const { data: slip, error: slipErr } = await supabase
+      .from("betslips")
+      .insert({ tipster_id, source_image_url: image_url, parsed_at: new Date().toISOString() })
+      .select("id")
+      .single();
+    if (slipErr) throw slipErr;
+    const betslip_id = slip.id;
+
+    const rows = [];
+    for (const sel of parsed.selections) {
+      let { partido, torneo, fecha_hora_texto, mercado, apuesta, cuota } = sel || {};
+      partido = cleanPartido(partido);
+      const casa_raw = sel?.casa_apuestas || parsed.bookmaker || null;
+      const casa_apuestas = cleanBookmaker(casa_raw, tipster_id);
+      let fecha_hora_iso = toISOFromES(fecha_hora_texto) || resolveRelativeDate(fecha_hora_texto);
+
+      if ((!torneo || !fecha_hora_iso) && partido) {
+        const web = await enrichViaWeb(partido, fecha_hora_texto);
+        if (web) {
+          if (!torneo && web.tournament) torneo = web.tournament;
+          if (!fecha_hora_iso && web.startIso) fecha_hora_iso = web.startIso;
+        }
+      }
+
+      const oddsNumber = parseFloat(String(cuota || "").replace(",", "."));
+      const insertObj = {
+        betslip_id,
+        match: partido || null,
+        tournament: torneo || null,
+        start_time_utc: fecha_hora_iso || null,
+        start_time_text: fecha_hora_iso ? null : fecha_hora_texto || null,
+        market: mercado || null,
+        pick: apuesta || null,
+        odds: Number.isFinite(oddsNumber) ? oddsNumber : null,
+        bookmaker: casa_apuestas || null
+      };
+      const { data: selIns } = await supabase
+        .from("bet_selections")
+        .insert(insertObj)
+        .select("*")
+        .single();
+      rows.push(selIns);
+    }
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ✅ Update selection
+app.post("/update-selection", async (req, res) => {
+  try {
+    const { selection_id, torneo, fecha_hora_iso, mercado, apuesta, cuota, casa_apuestas } = req.body || {};
+    if (!selection_id) return res.status(400).json({ error: "missing selection_id" });
+
+    const patch = {};
+    if (torneo !== undefined) patch.tournament = torneo;
+    if (fecha_hora_iso !== undefined) {
+      patch.start_time_utc = fecha_hora_iso;
+      if (fecha_hora_iso) patch.start_time_text = null;
+    }
+    if (mercado !== undefined) patch.market = mercado;
+    if (apuesta !== undefined) patch.pick = apuesta;
+    if (cuota !== undefined) patch.odds = parseFloat(cuota);
+    if (casa_apuestas !== undefined) patch.bookmaker = casa_apuestas;
+
+    const { data, error } = await supabase.from("bet_selections").update(patch).eq("id", selection_id).select("*").single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, selection: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ✅ Update stake
+app.post("/update-stake", async (req, res) => {
+  try {
+    const { betslip_id, stake, currency } = req.body || {};
+    if (!betslip_id) return res.status(400).json({ error: "missing betslip_id" });
+    const stakeNum = parseFloat(stake);
+    const { data, error } = await supabase
+      .from("betslips")
+      .update({ stake: stakeNum, currency })
+      .eq("id", betslip_id)
+      .select("*")
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, betslip: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ✅ List betslips
+app.get("/list-betslips", async (req, res) => {
+  try {
+    const { tipster_id } = req.query;
+    if (!tipster_id) return res.status(400).json({ error: "missing tipster_id" });
+    const { data: slips } = await supabase
+      .from("betslips")
+      .select("id, created_at, stake, currency, resultado, resultado_texto, closed_at, bet_selections(*)")
+      .eq("tipster_id", tipster_id)
+      .order("created_at", { ascending: false });
+    res.json(slips || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ✅ Delete betslip
+app.delete("/delete-betslip", async (req, res) => {
+  try {
+    const { betslip_id } = req.body;
+    if (!betslip_id) return res.status(400).json({ error: "missing betslip_id" });
+    await supabase.from("bet_selections").delete().eq("betslip_id", betslip_id);
+    await supabase.from("betslips").delete().eq("id", betslip_id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ✅ Close betslip
+app.post("/close-betslip", async (req, res) => {
+  try {
+    const { betslip_id, resultado, resultado_texto } = req.body;
+    if (!betslip_id) return res.status(400).json({ error: "missing betslip_id" });
+    const { data, error } = await supabase
+      .from("betslips")
+      .update({ resultado, resultado_texto, closed_at: new Date().toISOString() })
+      .eq("id", betslip_id)
+      .select("*")
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, betslip: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`✅ Server running on port ${port}`));
+
