@@ -86,6 +86,29 @@ function safeParseJson(text) {
     if (s >= 0 && e > s) try { return JSON.parse(text.slice(s, e + 1)); } catch {}
     return null;
   }
+// Detecta si un texto de fecha es ambiguo (sin año o con día de la semana)
+function isAmbiguousDate(text) {
+  if (!text) return true;
+  const t = String(text).toLowerCase().trim();
+  const hasYear = /\b(20\d{2})\b/.test(t);
+  const hasESlike = /\b(\d{1,2})\s*(\/|-)\s*(\d{1,2})\s*(\/|-)\s*(20\d{2})\b/.test(t); // dd/mm/yyyy
+  const hasWeekday = /\b(lun|mar|mié|mie|jue|vie|sáb|sab|dom|mon|tue|wed|thu|fri|sat|sun)\b/.test(t);
+  // Ej: "Jue, 30 Oct 13:45" → ambiguo
+  return !hasYear && !hasESlike || hasWeekday;
+}
+
+// Si “torneo” trae mercados típicos, los reasigna a mercado
+function sanitizeTournamentAndMarket(torneo, mercado) {
+  const BAD_AS_TOURNAMENT = [
+    "1x2","1X2","ganador","handicap","hándicap","handicap por sets",
+    "moneyline","over/under","ou","total goles","especiales","specials"
+  ].map(s=>s.toLowerCase());
+  const tor = (torneo||"").toLowerCase().trim();
+  if (tor && BAD_AS_TOURNAMENT.includes(tor)) {
+    // mover a mercado si mercado está vacío
+    return { torneo: null, mercado: mercado || torneo };
+  }
+  return { torneo, mercado };
 }
 
 // =======================================================
@@ -241,57 +264,68 @@ app.post("/parse-rows", async (req, res) => {
     const betslip_id = slip.id;
 
     const rows = [];
-    for (const sel of parsed.selections) {
-      let { partido, torneo, fecha_hora_texto, mercado, apuesta, cuota } = sel || {};
-      partido = cleanPartido(partido);
-      const casa_raw = sel?.casa_apuestas || parsed.bookmaker || null;
-      const casa_apuestas = cleanBookmaker(casa_raw, tipster_id);
+for (const sel of parsed.selections) {
+  let { partido, torneo, fecha_hora_texto, mercado, apuesta, cuota } = sel || {};
+  partido = cleanPartido(partido);
 
-      // fecha/hora desde imagen
-      let fecha_hora_iso = toISOFromES(fecha_hora_texto) || resolveRelativeDate(fecha_hora_texto);
+  // 2.1 Corregir “1x2” mal puesto en torneo
+  ({ torneo, mercado } = sanitizeTournamentAndMarket(torneo, mercado));
 
-      // enrichment web si falta torneo/hora
-      if ((!torneo || !fecha_hora_iso) && partido && USE_WEB) {
-        const web = await enrichViaWeb(partido, fecha_hora_texto, sport);
-        if (web) {
-          if (!torneo && web.tournament) torneo = web.tournament;
-          if (!fecha_hora_iso && web.startIso) fecha_hora_iso = web.startIso;
-        }
-      }
+  // 2.2 Casa de apuestas
+  const casa_raw = sel?.casa_apuestas || parsed.bookmaker || null;
+  const casa_apuestas = cleanBookmaker(casa_raw, tipster_id);
 
-      const oddsNumber = parseFloat(String(cuota || "").replace(",", "."));
-      const insertObj = {
-        betslip_id,
-        match: partido || null,
-        tournament: torneo || null,
-        start_time_utc: fecha_hora_iso || null,
-        start_time_text: fecha_hora_iso ? null : fecha_hora_texto || null,
-        market: mercado || null,
-        pick: apuesta || null,
-        odds: Number.isFinite(oddsNumber) ? oddsNumber : null,
-        bookmaker: casa_apuestas || null
-      };
-      const { data: selIns, error: selErr } = await supabase
-        .from("bet_selections")
-        .insert(insertObj)
-        .select("id, match, tournament, start_time_utc, start_time_text, market, pick, odds, bookmaker")
-        .single();
-      if (selErr) throw selErr;
+  // 2.3 Hora desde imagen (solo si NO es ambigua)
+  let fecha_hora_iso = null;
+  if (!isAmbiguousDate(fecha_hora_texto)) {
+    fecha_hora_iso = toISOFromES(fecha_hora_texto) || resolveRelativeDate(fecha_hora_texto);
+  }
 
-      rows.push({
-        "Partido": selIns.match,
-        "Torneo": selIns.tournament,
-        "Fecha y hora": selIns.start_time_utc
-          ? new Date(selIns.start_time_utc).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
-          : selIns.start_time_text,
-        "Mercado": selIns.market,
-        "Apuesta": selIns.pick,
-        "Cuota": selIns.odds,
-        "Casa de apuestas": selIns.bookmaker,
-        _betslip_id: betslip_id,
-        _selection_id: selIns.id
-      });
+  // 2.4 Enriquecimiento web SIEMPRE que falte torneo o fecha UTC
+  //     (el flag USE_WEB_ENRICH ya no bloquea)
+  if (partido && (!torneo || !fecha_hora_iso)) {
+    const web = await enrichViaWeb(partido, fecha_hora_texto, /* sport opcional */ "football");
+    if (web) {
+      if (!torneo && web.tournament) torneo = web.tournament;
+      if (!fecha_hora_iso && web.startIso) fecha_hora_iso = web.startIso;
     }
+  }
+
+  // 2.5 Insertar selección
+  const oddsNumber = parseFloat(String(cuota || "").replace(",", "."));
+  const insertObj = {
+    betslip_id,
+    match: partido || null,
+    tournament: torneo || null,
+    start_time_utc: fecha_hora_iso || null,
+    start_time_text: fecha_hora_iso ? null : (fecha_hora_texto || null),
+    market: mercado || null,
+    pick: apuesta || null,
+    odds: Number.isFinite(oddsNumber) ? oddsNumber : null,
+    bookmaker: casa_apuestas || null
+  };
+
+  const { data: selIns, error: selErr } = await supabase
+    .from("bet_selections")
+    .insert(insertObj)
+    .select("id, match, tournament, start_time_utc, start_time_text, market, pick, odds, bookmaker")
+    .single();
+  if (selErr) throw selErr;
+
+  rows.push({
+    "Partido": selIns.match,
+    "Torneo": selIns.tournament,
+    "Fecha y hora": selIns.start_time_utc
+      ? new Date(selIns.start_time_utc).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
+      : selIns.start_time_text,
+    "Mercado": selIns.market,
+    "Apuesta": selIns.pick,
+    "Cuota": selIns.odds,
+    "Casa de apuestas": selIns.bookmaker,
+    _betslip_id: betslip_id,
+    _selection_id: selIns.id
+  });
+}
     res.json(rows);
   } catch (e) {
     console.error("parse-rows error:", e);
