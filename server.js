@@ -190,7 +190,7 @@ app.get("/health", (_req, res) => res.send("ok"));
 app.get("/debug-enrich-web", async (req, res) => {
   try {
     const partido = req.query.partido ? cleanPartido(req.query.partido) : null;
-    if (!partido) return res.status(400).json({ error: "missing partido" });
+    if (!partido) return res.json({ ok: false, error: "missing partido" });
     const sport = req.query.sport || "football";
     const found = await enrichViaWeb(partido, null, sport);
     res.json({ ok: true, partido, found });
