@@ -397,21 +397,78 @@ app.delete("/delete-betslip", async (req, res) => {
 // 🟡 Buscar resultado en internet
 app.get("/check-result", async (req, res) => {
   try {
-    const { partido } = req.query;
+    const { partido, pick } = req.query;
     if (!partido) return res.status(400).json({ error: "missing partido" });
 
-    // Usa OpenAI con web search
-    const completion = await openai.responses.create({
-      model: "gpt-4o-mini",
-      tool_choice: "auto",
-      tools: [{ type: "web_search" }],
-      input: `Busca el resultado final del partido ${partido}. Indica si ya terminó y si fue ganado, perdido o nulo desde el punto de vista de apuestas.`,
+    const prompt = `Busca si el partido "${decodeURIComponent(
+      partido
+    )}" ya terminó HOY o AYER.
+Devuelve SOLO JSON:
+{"finished":true|false,"score":"x-y|null","status":"Ganada|Perdida|Nula|null","confidence":0..1,"sources":["url1","url2"]}
+
+Reglas:
+- Si no terminó: finished=false, el resto null.
+- Determina status respecto al pick del apostante (si se proporciona: "${pick || ""}"). 
+- Si no puedes determinar, status=null.`;
+
+    // 🔹 llamada directa a OpenAI Responses API (sin SDK)
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        input: prompt,
+        tools: [
+          {
+            type: "web_search",
+            user_location: {
+              type: "approximate",
+              country: "ES",
+              timezone: "Europe/Madrid",
+            },
+          },
+        ],
+        tool_choice: "auto",
+        temperature: 0.2,
+      }),
     });
 
-    const text = completion.output_text || "";
-    res.json({ finished: true, result: text });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`OpenAI error: ${text}`);
+    }
+
+    const result = await response.json();
+
+    let text = "";
+    try {
+      const out = result.output || [];
+      const msg = out.find(o => o.type === "message") || out[out.length - 1] || {};
+      text = (msg.content?.find(c => c.type === "output_text")?.text || "").trim();
+    } catch (err) {
+      console.warn("⚠️ parse text failed:", err);
+    }
+
+    // intenta extraer JSON del texto
+    const s = text.indexOf("{");
+    const e = text.lastIndexOf("}");
+    const parsed = s >= 0 && e > s ? JSON.parse(text.slice(s, e + 1)) : null;
+
+    res.json(
+      parsed || {
+        finished: false,
+        score: null,
+        status: null,
+        confidence: 0,
+        sources: [],
+      }
+    );
+  } catch (err) {
+    console.error("❌ /check-result error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
